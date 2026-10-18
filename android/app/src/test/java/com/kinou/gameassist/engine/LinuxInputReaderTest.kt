@@ -1,0 +1,477 @@
+package com.kinou.gameassist.engine
+
+import org.junit.Assert.*
+import org.junit.Test
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
+class LinuxInputReaderTest {
+
+    @Test
+    fun testParseAbsCodes_HidGamepadWithRightStickOnZRz() {
+        // `getevent -p` of a Bluetooth HID pad ("D3"): no ABS_RX / ABS_RY, triggers on GAS / BRAKE
+        val block = """
+            add device 1: /dev/input/event17
+              name:     "D3"
+              events:
+                KEY (0001): 0130  0131  0132  0133  0134  0135  0136  0137
+                            0138  0139  013a  013b  013c  013d  013e  013f
+                ABS (0003): 0000  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0001  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0002  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0005  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0009  : value 0, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            000a  : value 0, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0010  : value 0, min -1, max 1, fuzz 0, flat 0, resolution 0
+                            0011  : value 0, min -1, max 1, fuzz 0, flat 0, resolution 0
+                MSC (0004): 0004
+              input props:
+                <none>
+        """.trimIndent()
+
+        assertEquals(setOf(0x00, 0x01, 0x02, 0x05, 0x09, 0x0a, 0x10, 0x11), LinuxInputReader.parseAbsCodes(block))
+    }
+
+    @Test
+    fun testParseGamepadNodeInfo_DualShock4OnHidSonyDriver() {
+        // `getevent -p` of a DualShock 4 clone over Bluetooth (vendor 054c, product 05c4, hid-sony):
+        // right stick on ABS_RX / ABS_RY, triggers on ABS_Z / ABS_RZ
+        val block = """
+            add device 3: /dev/input/event16
+              name:     "Wireless Controller"
+              events:
+                KEY (0001): 0130  0131  0133  0134  0136  0137  0138  0139
+                            013a  013b  013c  013d  013e
+                ABS (0003): 0000  : value 128, min 0, max 255, fuzz 0, flat 0, resolution 0
+                            0001  : value 128, min 0, max 255, fuzz 0, flat 0, resolution 0
+                            0002  : value 0, min 0, max 255, fuzz 0, flat 0, resolution 0
+                            0003  : value 128, min 0, max 255, fuzz 0, flat 0, resolution 0
+                            0004  : value 128, min 0, max 255, fuzz 0, flat 0, resolution 0
+                            0005  : value 0, min 0, max 255, fuzz 0, flat 0, resolution 0
+                            0010  : value 0, min -1, max 1, fuzz 0, flat 0, resolution 0
+                            0011  : value 0, min -1, max 1, fuzz 0, flat 0, resolution 0
+                FF  (0015): 0050  0051  0058  0059  005a  0060
+              input props:
+                <none>
+        """.trimIndent()
+
+        val info = LinuxInputReader.parseGamepadNodeInfo(block)
+        assertNotNull(info)
+        assertEquals("/dev/input/event16", info!!.nodePath)
+        assertEquals(ControllerLayoutType.PLAYSTATION_HID_DRIVER, info.layoutType)
+        assertEquals(StickRangeMode.UNSIGNED_8BIT, info.stickRange)
+    }
+
+    @Test
+    fun testParseGamepadNodeInfo_DualShock4TouchpadAndMotionSensorsAreNotGamepads() {
+        val touchpad = """
+            add device 1: /dev/input/event18
+              name:     "Wireless Controller Touchpad"
+              events:
+                KEY (0001): 0110  0145  014a  014d
+                ABS (0003): 0000  : value 0, min 0, max 1919, fuzz 0, flat 0, resolution 0
+                            0001  : value 0, min 0, max 941, fuzz 0, flat 0, resolution 0
+                            002f  : value 0, min 0, max 1, fuzz 0, flat 0, resolution 0
+                            0035  : value 0, min 0, max 1919, fuzz 0, flat 0, resolution 0
+                            0036  : value 0, min 0, max 941, fuzz 0, flat 0, resolution 0
+                            0039  : value 0, min 0, max 65535, fuzz 0, flat 0, resolution 0
+              input props:
+                INPUT_PROP_POINTER
+                INPUT_PROP_BUTTONPAD
+        """.trimIndent()
+        val motionSensors = """
+            add device 2: /dev/input/event17
+              name:     "Wireless Controller Motion Sensors"
+              events:
+                ABS (0003): 0000  : value 0, min -32768, max 32768, fuzz 16, flat 0, resolution 8192
+                            0001  : value 0, min -32768, max 32768, fuzz 16, flat 0, resolution 8192
+                            0002  : value 0, min -32768, max 32768, fuzz 16, flat 0, resolution 8192
+                            0003  : value 0, min -2097152, max 2097152, fuzz 16, flat 0, resolution 1024
+                            0004  : value 0, min -2097152, max 2097152, fuzz 16, flat 0, resolution 1024
+                            0005  : value -63, min -2097152, max 2097152, fuzz 16, flat 0, resolution 1024
+                MSC (0004): 0005
+              input props:
+                INPUT_PROP_ACCELEROMETER
+        """.trimIndent()
+
+        assertNull(LinuxInputReader.parseGamepadNodeInfo(touchpad))
+        assertNull(LinuxInputReader.parseGamepadNodeInfo(motionSensors))
+    }
+
+    @Test
+    fun testParseGamepadNodeInfo_HidGamepadWithRightStickOnZRz() {
+        // "D3": the right stick stays on ABS_Z / ABS_RZ (GENERIC_BLUETOOTH mapping)
+        val block = """
+            add device 1: /dev/input/event17
+              name:     "D3"
+              events:
+                KEY (0001): 0130  0131  0132  0133  0134  0135  0136  0137
+                ABS (0003): 0000  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0001  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0002  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0005  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0009  : value 0, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            000a  : value 0, min 0, max 255, fuzz 0, flat 15, resolution 0
+              input props:
+                <none>
+        """.trimIndent()
+
+        assertEquals(ControllerLayoutType.GENERIC_BLUETOOTH, LinuxInputReader.parseGamepadNodeInfo(block)?.layoutType)
+    }
+
+    @Test
+    fun testParseAbsCodes_NoAbsSection() {
+        val block = "I: Bus=0005 Vendor=1949 Product=0402 Version=0111\nN: Name=\"D3\"\nB: ABS=30627"
+        assertTrue(LinuxInputReader.parseAbsCodes(block).isEmpty())
+    }
+
+    @Test
+    fun testParseBinaryEvent64() {
+        // Construct a 24-byte 64-bit struct input_event
+        // tv_sec (8B) = 1000, tv_usec (8B) = 500
+        // type (2B) = 0x0003 (EV_ABS), code (2B) = 0x0000 (ABS_X), value (4B) = 32768 (0x00008000)
+        val buf = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putLong(1000L) // tv_sec
+        buf.putLong(500L)  // tv_usec
+        buf.putShort(0x0003.toShort()) // type = EV_ABS
+        buf.putShort(0x0000.toShort()) // code = ABS_X
+        buf.putInt(32768) // value = 32768 (center stick)
+
+        val outEvent = BinaryInputParser.RawInputEvent()
+        val success = BinaryInputParser.parseBinaryEvent64(buf.array(), 0, outEvent)
+
+        assertTrue(success)
+        assertEquals(BinaryInputParser.EV_ABS, outEvent.type)
+        assertEquals(0x0000, outEvent.code)
+        assertEquals(32768L, outEvent.value)
+    }
+
+    @Test
+    fun testParseBinaryEvent64_NegativeSignedValue() {
+        // Test negative 32-bit value sign extension: -100
+        val buf = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putLong(1234L)
+        buf.putLong(5678L)
+        buf.putShort(0x0003.toShort()) // EV_ABS
+        buf.putShort(0x0010.toShort()) // ABS_HAT0X
+        buf.putInt(-1) // DPad Left (-1)
+
+        val outEvent = BinaryInputParser.RawInputEvent()
+        val success = BinaryInputParser.parseBinaryEvent64(buf.array(), 0, outEvent)
+
+        assertTrue(success)
+        assertEquals(BinaryInputParser.EV_ABS, outEvent.type)
+        assertEquals(0x0010, outEvent.code)
+        assertEquals(-1L, outEvent.value)
+    }
+
+    @Test
+    fun testParseBinaryEvent64_TruncatedBufferReturnsFalse() {
+        val shortBuf = ByteArray(20) // Less than 24 bytes
+        val outEvent = BinaryInputParser.RawInputEvent()
+        assertFalse(BinaryInputParser.parseBinaryEvent64(shortBuf, 0, outEvent))
+        assertFalse(BinaryInputParser.parseBinaryEvent64(ByteArray(30), 10, outEvent)) // 30 - 10 = 20 < 24
+    }
+
+    @Test
+    fun testParseBinaryEvent32() {
+        // 16-byte 32-bit struct input_event
+        // tv_sec (4B) = 100, tv_usec (4B) = 200, type (2B) = 0x0001 (EV_KEY), code = 0x0130 (BTN_A), value = 1 (Down)
+        val buf = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putInt(100)
+        buf.putInt(200)
+        buf.putShort(0x0001.toShort()) // EV_KEY
+        buf.putShort(0x0130.toShort()) // BTN_A
+        buf.putInt(1) // Press down
+
+        val outEvent = BinaryInputParser.RawInputEvent()
+        val success = BinaryInputParser.parseBinaryEvent32(buf.array(), 0, outEvent)
+
+        assertTrue(success)
+        assertEquals(BinaryInputParser.EV_KEY, outEvent.type)
+        assertEquals(0x0130, outEvent.code)
+        assertEquals(1L, outEvent.value)
+        assertEquals("BUTTON_A", BinaryInputParser.evKeyToButtonName(outEvent.code))
+    }
+
+    @Test
+    fun testParseBinaryEvent32_TruncatedBufferReturnsFalse() {
+        val shortBuf = ByteArray(12) // Less than 16 bytes
+        val outEvent = BinaryInputParser.RawInputEvent()
+        assertFalse(BinaryInputParser.parseBinaryEvent32(shortBuf, 0, outEvent))
+    }
+
+    @Test
+    fun testParseAsciiHexLine_StandardQuietFormat() {
+        val line = "0003 0000 00007e2f\n".toByteArray(Charsets.US_ASCII)
+        val outEvent = BinaryInputParser.RawInputEvent()
+        val success = BinaryInputParser.parseAsciiHexLine(line, 0, line.size, outEvent)
+
+        assertTrue(success)
+        assertEquals(0x0003, outEvent.type)
+        assertEquals(0x0000, outEvent.code)
+        assertEquals(0x00007e2fL, outEvent.value)
+    }
+
+    @Test
+    fun testParseAsciiHexLine_WithDevicePrefix() {
+        val line = "/dev/input/event10: 0001 0136 00000001\r\n".toByteArray(Charsets.US_ASCII)
+        val outEvent = BinaryInputParser.RawInputEvent()
+        val success = BinaryInputParser.parseAsciiHexLine(line, 0, line.size, outEvent)
+
+        assertTrue(success)
+        assertEquals(0x0001, outEvent.type)
+        assertEquals(0x0136, outEvent.code)
+        assertEquals(1L, outEvent.value)
+        assertEquals("BUTTON_L1", BinaryInputParser.evKeyToButtonName(outEvent.code))
+    }
+
+    @Test
+    fun testParseAsciiHexLine_WithTimestamp() {
+        val line = "[ 12345.678901] 0003 0010 ffffffff\n".toByteArray(Charsets.US_ASCII)
+        val outEvent = BinaryInputParser.RawInputEvent()
+        val success = BinaryInputParser.parseAsciiHexLine(line, 0, line.size, outEvent)
+
+        assertTrue(success)
+        assertEquals(0x0003, outEvent.type)
+        assertEquals(0x0010, outEvent.code)
+        assertEquals(-1L, outEvent.value) // ffffffff sign-extended
+    }
+
+    @Test
+    fun testParseAsciiHexLine_InvalidHexReturnsFalse() {
+        val line = "0003 0010 zzzzzzzz\n".toByteArray(Charsets.US_ASCII)
+        val outEvent = BinaryInputParser.RawInputEvent()
+        val success = BinaryInputParser.parseAsciiHexLine(line, 0, line.size, outEvent)
+
+        assertFalse(success)
+    }
+
+    @Test
+    fun testParseAsciiHexLine_EmptyReturnsFalse() {
+        val line = "   \n".toByteArray(Charsets.US_ASCII)
+        val outEvent = BinaryInputParser.RawInputEvent()
+        val success = BinaryInputParser.parseAsciiHexLine(line, 0, line.size, outEvent)
+
+        assertFalse(success)
+    }
+
+    @Test
+    fun testNormalizeStick() {
+        // Standard Android/Linux 16-bit Unsigned (0..65535, center 32768)
+        assertEquals(0.0f, BinaryInputParser.normalizeStick(32768L), 0.0001f) // Center
+        assertEquals(1.0f, BinaryInputParser.normalizeStick(65535L), 0.00001f) // Max right/down exact 1.0f
+        assertEquals(-1.0f, BinaryInputParser.normalizeStick(0L), 0.00001f) // Max left/up exact -1.0f
+        assertEquals(0.5f, BinaryInputParser.normalizeStick(49152L), 0.01f) // Half right/down
+        assertEquals(-0.5f, BinaryInputParser.normalizeStick(16384L), 0.01f) // Half left/up
+
+        // Signed 16-bit extension
+        assertEquals(-1.0f, BinaryInputParser.normalizeStick(-32768L), 0.00001f)
+        assertEquals(-0.5f, BinaryInputParser.normalizeStick(-16384L), 0.001f)
+
+        // Explicit Signed 16-bit mode (xpad / USB OTG)
+        assertEquals(0.0f, BinaryInputParser.normalizeStick(0L, StickRangeMode.SIGNED_16BIT), 0.0001f)
+        assertEquals(1.0f, BinaryInputParser.normalizeStick(32767L, StickRangeMode.SIGNED_16BIT), 0.0001f)
+        assertEquals(-1.0f, BinaryInputParser.normalizeStick(-32768L, StickRangeMode.SIGNED_16BIT), 0.0001f)
+        assertEquals(0.5f, BinaryInputParser.normalizeStick(16384L, StickRangeMode.SIGNED_16BIT), 0.001f)
+    }
+
+    @Test
+    fun testKeyMappingLookup() {
+        assertEquals("BUTTON_A", BinaryInputParser.evKeyToButtonName(0x0130))
+        assertEquals("BUTTON_B", BinaryInputParser.evKeyToButtonName(0x0131))
+        assertEquals("BUTTON_X", BinaryInputParser.evKeyToButtonName(0x0133))
+        assertEquals("BUTTON_Y", BinaryInputParser.evKeyToButtonName(0x0134))
+        assertEquals("BUTTON_L1", BinaryInputParser.evKeyToButtonName(0x0136))
+        assertEquals("BUTTON_R1", BinaryInputParser.evKeyToButtonName(0x0137))
+        assertEquals("BUTTON_L2", BinaryInputParser.evKeyToButtonName(0x0138))
+        assertEquals("BUTTON_R2", BinaryInputParser.evKeyToButtonName(0x0139))
+        assertEquals("BUTTON_START", BinaryInputParser.evKeyToButtonName(0x013b))
+        assertEquals("BUTTON_SELECT", BinaryInputParser.evKeyToButtonName(0x013a))
+        assertEquals("DPAD_UP", BinaryInputParser.evKeyToButtonName(0x0220))
+        assertEquals("DPAD_DOWN", BinaryInputParser.evKeyToButtonName(0x0221))
+        assertNull(BinaryInputParser.evKeyToButtonName(0x9999))
+    }
+
+    @Test
+    fun testPlayStationKeyMapping() {
+        val ps = ControllerLayoutType.PLAYSTATION
+        assertEquals("BUTTON_A", BinaryInputParser.evKeyToButtonName(0x0130, ps)) // Cross
+        assertEquals("BUTTON_B", BinaryInputParser.evKeyToButtonName(0x0131, ps)) // Circle
+        assertEquals("BUTTON_X", BinaryInputParser.evKeyToButtonName(0x0132, ps)) // Square
+        assertEquals("BUTTON_Y", BinaryInputParser.evKeyToButtonName(0x0133, ps)) // Triangle
+        assertEquals("BUTTON_L1", BinaryInputParser.evKeyToButtonName(0x0134, ps)) // L1
+        assertEquals("BUTTON_R1", BinaryInputParser.evKeyToButtonName(0x0135, ps)) // R1
+        assertEquals("BUTTON_L2", BinaryInputParser.evKeyToButtonName(0x0136, ps)) // L2
+        assertEquals("BUTTON_R2", BinaryInputParser.evKeyToButtonName(0x0137, ps)) // R2
+    }
+
+    @Test
+    fun testPlayStationHidDriverKeyMapping() {
+        // Matches Android's Vendor_054c_Product_05c4_Version_8100.kl
+        val ps = ControllerLayoutType.PLAYSTATION_HID_DRIVER
+        assertEquals("BUTTON_A", BinaryInputParser.evKeyToButtonName(0x0130, ps)) // Cross
+        assertEquals("BUTTON_B", BinaryInputParser.evKeyToButtonName(0x0131, ps)) // Circle
+        assertEquals("BUTTON_Y", BinaryInputParser.evKeyToButtonName(0x0133, ps)) // Triangle
+        assertEquals("BUTTON_X", BinaryInputParser.evKeyToButtonName(0x0134, ps)) // Square
+        assertEquals("BUTTON_L1", BinaryInputParser.evKeyToButtonName(0x0136, ps))
+        assertEquals("BUTTON_R1", BinaryInputParser.evKeyToButtonName(0x0137, ps))
+        assertEquals("BUTTON_L2", BinaryInputParser.evKeyToButtonName(0x0138, ps))
+        assertEquals("BUTTON_R2", BinaryInputParser.evKeyToButtonName(0x0139, ps))
+        assertEquals("BUTTON_SELECT", BinaryInputParser.evKeyToButtonName(0x013a, ps))
+        assertEquals("BUTTON_START", BinaryInputParser.evKeyToButtonName(0x013b, ps))
+        assertEquals("BUTTON_MODE", BinaryInputParser.evKeyToButtonName(0x013c, ps))
+        assertEquals("BUTTON_THUMBL", BinaryInputParser.evKeyToButtonName(0x013d, ps))
+        assertEquals("BUTTON_THUMBR", BinaryInputParser.evKeyToButtonName(0x013e, ps))
+    }
+
+    @Test
+    fun testStickRangeModes() {
+        // 8-bit unsigned (0..255, center 128)
+        assertEquals(0.0f, BinaryInputParser.normalizeStick(128L, StickRangeMode.UNSIGNED_8BIT), 0.001f)
+        assertEquals(1.0f, BinaryInputParser.normalizeStick(255L, StickRangeMode.UNSIGNED_8BIT), 0.001f)
+        assertEquals(-1.0f, BinaryInputParser.normalizeStick(0L, StickRangeMode.UNSIGNED_8BIT), 0.001f)
+
+        // 16-bit unsigned (0..65535, center 32768)
+        assertEquals(0.0f, BinaryInputParser.normalizeStick(32768L, StickRangeMode.UNSIGNED_16BIT), 0.001f)
+        assertEquals(1.0f, BinaryInputParser.normalizeStick(65535L, StickRangeMode.UNSIGNED_16BIT), 0.001f)
+        assertEquals(-1.0f, BinaryInputParser.normalizeStick(0L, StickRangeMode.UNSIGNED_16BIT), 0.001f)
+
+        // 16-bit signed (-32768..32767, center 0)
+        assertEquals(0.0f, BinaryInputParser.normalizeStick(0L, StickRangeMode.SIGNED_16BIT), 0.001f)
+        assertEquals(1.0f, BinaryInputParser.normalizeStick(32767L, StickRangeMode.SIGNED_16BIT), 0.001f)
+        assertEquals(-1.0f, BinaryInputParser.normalizeStick(-32768L, StickRangeMode.SIGNED_16BIT), 0.001f)
+    }
+
+    @Test
+    fun testParseBinaryEvent64_RightStickAndTriggers() {
+        val outEvent = BinaryInputParser.RawInputEvent()
+
+        // ABS_RX (0x0003) = Right Stick X
+        val bufRx = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
+            .putLong(0L).putLong(0L).putShort(0x0003.toShort()).putShort(0x0003.toShort()).putInt(32768)
+        assertTrue(BinaryInputParser.parseBinaryEvent64(bufRx.array(), 0, outEvent))
+        assertEquals(0x0003, outEvent.code)
+        assertEquals(0.0f, BinaryInputParser.normalizeStick(outEvent.value), 0.001f)
+
+        // ABS_Z (0x0002) = LT Trigger (0 at rest, up to 32767)
+        val bufZ = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
+            .putLong(0L).putLong(0L).putShort(0x0003.toShort()).putShort(0x0002.toShort()).putInt(15000)
+        assertTrue(BinaryInputParser.parseBinaryEvent64(bufZ.array(), 0, outEvent))
+        assertEquals(0x0002, outEvent.code)
+        assertEquals(15000L, outEvent.value)
+
+        // ABS_RZ (0x0005) = RT Trigger (0 at rest, up to 32767)
+        val bufRz = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
+            .putLong(0L).putLong(0L).putShort(0x0003.toShort()).putShort(0x0005.toShort()).putInt(30000)
+        assertTrue(BinaryInputParser.parseBinaryEvent64(bufRz.array(), 0, outEvent))
+        assertEquals(0x0005, outEvent.code)
+        assertEquals(30000L, outEvent.value)
+    }
+
+    @Test
+    fun testParseAbsAxisLines_NamesCodesAndKeepsRanges() {
+        val block = """
+            add device 1: /dev/input/event17
+              name:     "PG-9128 Consumer Control"
+              events:
+                KEY (0001): 0130  0131  0132  0133
+                ABS (0003): 0000  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0001  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0002  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0005  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0009  : value 0, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            000a  : value 0, min 0, max 255, fuzz 0, flat 15, resolution 0
+              input props:
+                <none>
+        """.trimIndent()
+
+        assertEquals(
+            listOf(
+                "ABS_X (0000): value 128, min 0, max 255, fuzz 0, flat 15, resolution 0",
+                "ABS_Y (0001): value 128, min 0, max 255, fuzz 0, flat 15, resolution 0",
+                "ABS_Z (0002): value 128, min 0, max 255, fuzz 0, flat 15, resolution 0",
+                "ABS_RZ (0005): value 128, min 0, max 255, fuzz 0, flat 15, resolution 0",
+                "ABS_GAS (0009): value 0, min 0, max 255, fuzz 0, flat 15, resolution 0",
+                "ABS_BRAKE (000a): value 0, min 0, max 255, fuzz 0, flat 15, resolution 0"
+            ),
+            LinuxInputReader.parseAbsAxisLines(block)
+        )
+    }
+
+    @Test
+    fun testParseAbsAxisLines_NoAbsSectionIsEmpty() {
+        assertTrue(LinuxInputReader.parseAbsAxisLines("I: Bus=0005\nN: Name=\"D3\"\n").isEmpty())
+    }
+
+    @Test
+    fun testParseGamepadNodeInfo_CarriesRawAxisLines() {
+        val block = """
+            add device 1: /dev/input/event17
+              name:     "PG-9128 Consumer Control"
+              events:
+                KEY (0001): 0130  0131  0132  0133
+                ABS (0003): 0002  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+                            0005  : value 128, min 0, max 255, fuzz 0, flat 15, resolution 0
+        """.trimIndent()
+
+        val info = LinuxInputReader.parseGamepadNodeInfo(block)
+        assertNotNull(info)
+        assertEquals(
+            listOf(
+                "ABS_Z (0002): value 128, min 0, max 255, fuzz 0, flat 15, resolution 0",
+                "ABS_RZ (0005): value 128, min 0, max 255, fuzz 0, flat 15, resolution 0"
+            ),
+            info!!.absAxes
+        )
+    }
+
+    @Test
+    fun testAxisRouting_PlayStationHidDriverPutsRightStickOnRxRy() {
+        val hid = ControllerLayoutType.PLAYSTATION_HID_DRIVER
+        assertEquals(AxisTarget.RIGHT_X, LinuxInputReader.axisTarget(hid, 0x0003))
+        assertEquals(AxisTarget.RIGHT_Y, LinuxInputReader.axisTarget(hid, 0x0004))
+        assertEquals(AxisTarget.TRIGGER_L2, LinuxInputReader.axisTarget(hid, 0x0002))
+        assertEquals(AxisTarget.TRIGGER_R2, LinuxInputReader.axisTarget(hid, 0x0005))
+    }
+
+    @Test
+    fun testAxisRouting_PlainPlayStationKeepsRightStickOnZRz() {
+        val ps = ControllerLayoutType.PLAYSTATION
+        assertEquals(AxisTarget.RIGHT_X, LinuxInputReader.axisTarget(ps, 0x0002))
+        assertEquals(AxisTarget.RIGHT_Y, LinuxInputReader.axisTarget(ps, 0x0005))
+        assertEquals(AxisTarget.TRIGGER_L2, LinuxInputReader.axisTarget(ps, 0x0003))
+        assertEquals(AxisTarget.TRIGGER_R2, LinuxInputReader.axisTarget(ps, 0x0004))
+    }
+
+    @Test
+    fun testAxisRouting_GenericBluetoothReadsZRzAsRightStick() {
+        // Issue #3: a HID pad whose right stick sits on ABS_Z / ABS_RZ (triggers on GAS / BRAKE).
+        val bt = ControllerLayoutType.GENERIC_BLUETOOTH
+        assertEquals(AxisTarget.RIGHT_X, LinuxInputReader.axisTarget(bt, 0x0002))
+        assertEquals(AxisTarget.RIGHT_Y, LinuxInputReader.axisTarget(bt, 0x0005))
+        assertEquals(AxisTarget.TRIGGER_L2, LinuxInputReader.axisTarget(bt, 0x000a))
+        assertEquals(AxisTarget.TRIGGER_R2, LinuxInputReader.axisTarget(bt, 0x0009))
+    }
+
+    @Test
+    fun testAxisRouting_GenericUsbReadsZRzAsTriggers() {
+        // The other side of the coin: an Xbox-style pad where ABS_Z / ABS_RZ ARE the triggers.
+        val usb = ControllerLayoutType.GENERIC_USB
+        assertEquals(AxisTarget.RIGHT_X, LinuxInputReader.axisTarget(usb, 0x0003))
+        assertEquals(AxisTarget.RIGHT_Y, LinuxInputReader.axisTarget(usb, 0x0004))
+        assertEquals(AxisTarget.TRIGGER_L2, LinuxInputReader.axisTarget(usb, 0x0002))
+        assertEquals(AxisTarget.TRIGGER_R2, LinuxInputReader.axisTarget(usb, 0x0005))
+    }
+
+    @Test
+    fun testAxisRouting_EveryLayoutRoutesLeftStickHatAndUnknownCode() {
+        ControllerLayoutType.values().forEach { layout ->
+            assertEquals("LX for $layout", AxisTarget.LEFT_X, LinuxInputReader.axisTarget(layout, 0x0000))
+            assertEquals("LY for $layout", AxisTarget.LEFT_Y, LinuxInputReader.axisTarget(layout, 0x0001))
+            assertEquals("HAT_X for $layout", AxisTarget.HAT_X, LinuxInputReader.axisTarget(layout, 0x0010))
+            assertEquals("HAT_Y for $layout", AxisTarget.HAT_Y, LinuxInputReader.axisTarget(layout, 0x0011))
+            assertEquals("unmapped for $layout", AxisTarget.NONE, LinuxInputReader.axisTarget(layout, 0x9999))
+        }
+    }
+}

@@ -1,0 +1,192 @@
+name: CI & Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  backend-test:
+    name: Backend Tests (Cloudflare Worker)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js 22 (LTS)
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: backend
+        run: npm ci
+
+      - name: Run Backend Vitest Tests
+        working-directory: backend
+        run: npm test
+
+  android-build:
+    name: Android Build & Test
+    runs-on: ubuntu-latest
+    env:
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      APP_SECRET: ${{ secrets.APP_SECRET }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+
+      - name: Validate Gradle Wrapper
+        uses: gradle/actions/wrapper-validation@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: wrapper
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
+
+      - name: Run Android Unit Tests
+        run: |
+          cd android
+          ./gradlew testDebugUnitTest
+
+      - name: Decode signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "Decoding release keystore..."
+            mkdir -p android/app/keystore
+            echo "$KEYSTORE_BASE64" | base64 -d > android/app/keystore/openmapper.keystore
+          else
+            echo "No signing keystore secret provided. Skipping decode."
+          fi
+
+      - name: Build Android APK
+        id: build_apk
+        run: |
+          cd android
+          if [ -f "app/keystore/openmapper.keystore" ] && [ -n "$KEYSTORE_PASSWORD" ] && [ -n "$APP_SECRET" ]; then
+            echo "Building signed Release APK..."
+            ./gradlew assembleRelease
+            echo "BUILD_TYPE=release" >> $GITHUB_ENV
+            echo "APK_PATH=app/build/outputs/apk/release/app-release.apk" >> $GITHUB_ENV
+          else
+            echo "Building Debug APK (missing keystore or signing secrets)..."
+            ./gradlew assembleDebug
+            echo "BUILD_TYPE=debug" >> $GITHUB_ENV
+            echo "APK_PATH=app/build/outputs/apk/debug/app-debug.apk" >> $GITHUB_ENV
+          fi
+
+      - name: Rename APK for Distribution
+        run: |
+          mkdir -p dist
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+            cp android/${{ env.APK_PATH }} dist/OpenMapper-latest.apk
+            cp dist/OpenMapper-latest.apk dist/OpenMapper-${TAG_NAME}.apk
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            cp android/${{ env.APK_PATH }} dist/OpenMapper-PR-${PR_NUMBER}.apk
+          else
+            cp android/${{ env.APK_PATH }} dist/OpenMapper-latest.apk
+          fi
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ github.event_name == 'pull_request' && format('OpenMapper-PR-{0}', github.event.pull_request.number) || 'OpenMapper-APK' }}
+          path: dist/*.apk
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: [backend-test, android-build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: OpenMapper-APK
+          path: dist
+
+      - name: Generate Release Body
+        run: |
+          TAG_NAME="${{ github.ref_name }}"
+          TAG_MESSAGE=$(git tag -l --format='%(contents)' "$TAG_NAME" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+          # Compute the SHA-256 checksum of the release APK
+          TARGET_APK="dist/OpenMapper-${TAG_NAME}.apk"
+          if [ ! -f "$TARGET_APK" ]; then
+            TARGET_APK="dist/OpenMapper-latest.apk"
+          fi
+          APK_SHA256=""
+          if [ -f "$TARGET_APK" ]; then
+            APK_SHA256=$(sha256sum "$TARGET_APK" | cut -d' ' -f1)
+          fi
+
+          cat << 'EOF' > release_body.md
+          ## 🎮 OpenMapper ${{ github.ref_name }}
+
+          Welcome to OpenMapper **${{ github.ref_name }}**!
+
+          ### 📱 Install & get started
+          1. Download the APK **`OpenMapper-${{ github.ref_name }}.apk`** below.
+          2. Install it on your Android device.
+          3. Make sure **[Shizuku](https://shizuku.rikka.app/)** is running on your phone to get key mapping and touch injection at ultra-low latency (< 0.5 ms).
+
+          EOF
+
+          if [ -n "$APK_SHA256" ]; then
+            echo "**SHA-256:** \`${APK_SHA256}\`" >> release_body.md
+            echo "" >> release_body.md
+          fi
+
+          if [ -n "$TAG_MESSAGE" ] && [ "$TAG_MESSAGE" != "$TAG_NAME" ]; then
+            echo "### 📝 Release notes" >> release_body.md
+            echo "$TAG_MESSAGE" >> release_body.md
+            echo "" >> release_body.md
+          fi
+
+          echo "---" >> release_body.md
+          echo "### 📋 Detailed commit changelog" >> release_body.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.apk
+          body_path: release_body.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          name: "OpenMapper Release ${{ github.ref_name }}"

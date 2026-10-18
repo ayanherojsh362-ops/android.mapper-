@@ -1,0 +1,670 @@
+package com.kinou.gameassist.service
+
+import android.annotation.SuppressLint
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.os.Build
+import android.os.IBinder
+import android.provider.Settings
+import android.util.DisplayMetrics
+import android.view.*
+import android.widget.FrameLayout
+import androidx.core.app.NotificationCompat
+import androidx.lifecycle.LifecycleService
+import androidx.lifecycle.lifecycleScope
+import com.kinou.gameassist.MainActivity
+import com.kinou.gameassist.R
+import com.kinou.gameassist.data.model.GameProfile
+import com.kinou.gameassist.data.model.deepCopy
+import com.kinou.gameassist.data.repository.ProfileRepository
+import com.kinou.gameassist.engine.CursorSpeed
+import com.kinou.gameassist.engine.GamepadEngine
+import com.kinou.gameassist.engine.TacticalKind
+import com.kinou.gameassist.injector.ShizukuManager
+import com.kinou.gameassist.injector.ShizukuStatus
+import com.kinou.gameassist.injector.ShizukuTouchInjector
+import com.kinou.gameassist.ui.overlay.CursorOverlayView
+import com.kinou.gameassist.ui.overlay.EdgeHandleOverlayView
+import com.kinou.gameassist.ui.overlay.HudEditorOverlayView
+import com.kinou.gameassist.util.InputDeviceCallbacks
+
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import com.kinou.gameassist.util.AppLog
+
+class OverlayService : LifecycleService() {
+
+    companion object {
+        const val CHANNEL_ID = "gameassist_overlay_channel"
+        const val NOTIFICATION_ID = 2026
+        const val ACTION_START = "ACTION_START"
+        const val ACTION_STOP = "ACTION_STOP"
+        const val EXTRA_PROFILE_ID = "EXTRA_PROFILE_ID"
+
+        // Délai avant d'écrire la vitesse du curseur sur disque (voir cursorSpeedSave).
+        private const val CURSOR_SPEED_SAVE_DEBOUNCE_MS = 400L
+
+        private val _isServiceRunning = MutableStateFlow(false)
+        val isServiceRunningFlow: StateFlow<Boolean> = _isServiceRunning.asStateFlow()
+        val isServiceRunning: Boolean get() = _isServiceRunning.value
+
+        private val _liveProfileUpdateFlow = MutableSharedFlow<GameProfile>(replay = 0, extraBufferCapacity = 1)
+        val liveProfileUpdateFlow: SharedFlow<GameProfile> = _liveProfileUpdateFlow.asSharedFlow()
+
+        fun updateLiveProfile(profile: GameProfile) {
+            _liveProfileUpdateFlow.tryEmit(profile)
+        }
+    }
+
+    private lateinit var windowManager: WindowManager
+    private lateinit var repository: ProfileRepository
+    private lateinit var injector: ShizukuTouchInjector
+    private lateinit var hapticManager: com.kinou.gameassist.engine.HapticManager
+    private lateinit var engine: GamepadEngine
+
+    private var currentProfile: GameProfile? = null
+
+    // Overlay Views
+    private var edgeHandleView: EdgeHandleOverlayView? = null
+    private var edgeHandleParams: WindowManager.LayoutParams? = null
+
+    private var editorView: HudEditorOverlayView? = null
+
+    // Curseur virtuel (L3+R3)
+    private var cursorView: CursorOverlayView? = null
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val cursorRedrawPending = java.util.concurrent.atomic.AtomicBoolean(false)
+    // Runnable unique réutilisé : aucune allocation par frame depuis le thread moteur
+    private val cursorRedraw = Runnable {
+        cursorRedrawPending.set(false)
+        cursorView?.update(engine.cursorX, engine.cursorY, engine.isCursorTouching)
+    }
+    // Le D-pad peut être pressé 16 fois d'affilée (0.25x par cran) : on diffère l'écriture disque
+    // et on sauvegarde une copie immuable plutôt que de muter l'objet vivant du StateFlow.
+    private val cursorSpeedSave = Runnable {
+        val profile = currentProfile ?: return@Runnable
+        val updated = profile.deepCopy()
+        updated.settings.cursorSpeed = engine.cursorSpeed
+        currentProfile = updated
+        lifecycleScope.launch { repository.saveProfileAsync(updated) }
+    }
+    private var currentEditorBitmap: Bitmap? = null
+    private var screenshotLoadJob: kotlinx.coroutines.Job? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        repository = ProfileRepository.getInstance(this)
+        injector = ShizukuTouchInjector()
+        hapticManager = com.kinou.gameassist.engine.HapticManager(this)
+        engine = GamepadEngine(this, injector, lifecycleScope, hapticManager)
+
+        engine.onHotSwitchProfile = { forward ->
+            cycleProfile(forward)
+        }
+        engine.onTacticalToggle = { event ->
+            val message = when (event.kind) {
+                TacticalKind.ANTI_RECOIL -> if (event.enabled) {
+                    getString(R.string.tactical_antirecoil_on, event.speed)
+                } else {
+                    getString(R.string.tactical_antirecoil_off)
+                }
+                TacticalKind.JIGGLE_STRAFE -> if (event.enabled) {
+                    getString(R.string.tactical_strafe_on)
+                } else {
+                    getString(R.string.tactical_strafe_off)
+                }
+            }
+            showHotSwitchToast(message)
+        }
+        engine.onCursorModeChanged = { on ->
+            mainHandler.post { if (on) showCursorOverlay() else hideCursorOverlay() }
+        }
+        engine.onCursorMoved = {
+            // Appelé jusqu'à 240 fois/s depuis le thread moteur : un seul redraw en attente à la fois
+            if (cursorRedrawPending.compareAndSet(false, true)) {
+                mainHandler.post(cursorRedraw)
+            }
+        }
+        engine.onCursorSpeedChanged = { speed ->
+            mainHandler.post {
+                cursorView?.showLabel(formatCursorSpeed(speed))
+                mainHandler.removeCallbacks(cursorSpeedSave)
+                mainHandler.postDelayed(cursorSpeedSave, CURSOR_SPEED_SAVE_DEBOUNCE_MS)
+            }
+        }
+
+        lifecycleScope.launch {
+            liveProfileUpdateFlow.collect { profile ->
+                val isDifferent = currentProfile?.id != profile.id
+                currentProfile = profile
+                engine.setProfile(profile)
+                if (isDifferent) {
+                    updateNotification()
+                }
+            }
+        }
+
+        lifecycleScope.launch {
+            ShizukuManager.status.collect { status ->
+                if (status == ShizukuStatus.RUNNING_AUTHORIZED) {
+                    // Rebranche l'injecteur ET relance le lecteur /dev/input si le moteur
+                    // tourne (ses sous-processus `cat` meurent avec le binder Shizuku).
+                    // Exécuté hors du thread UI (Dispatchers.IO) pour éviter tout jank/ANR lié aux IPC Binder synchrones.
+                    withContext(Dispatchers.IO) {
+                        engine.onShizukuReconnected()
+                    }
+                } else if (_isServiceRunning.value && status == ShizukuStatus.DEAD) {
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        android.widget.Toast.makeText(
+                            applicationContext,
+                            getString(R.string.service_shizuku_lost),
+                            android.widget.Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            }
+        }
+
+        updateScreenMetrics()
+        createNotificationChannel()
+
+        val btFilter = android.content.IntentFilter().apply {
+            addAction(android.bluetooth.BluetoothDevice.ACTION_ACL_DISCONNECTED)
+            addAction(android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED)
+        }
+        try {
+            androidx.core.content.ContextCompat.registerReceiver(
+                this,
+                bluetoothDisconnectReceiver,
+                btFilter,
+                androidx.core.content.ContextCompat.RECEIVER_EXPORTED
+            )
+        } catch (_: Exception) {}
+    }
+
+    private val bluetoothDisconnectReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                android.bluetooth.BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
+                    val device = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(android.bluetooth.BluetoothDevice.EXTRA_DEVICE, android.bluetooth.BluetoothDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(android.bluetooth.BluetoothDevice.EXTRA_DEVICE)
+                    }
+                    val devClass = device?.bluetoothClass
+                    val isGamepadOrPeripheral = devClass?.let {
+                        it.majorDeviceClass == android.bluetooth.BluetoothClass.Device.Major.PERIPHERAL ||
+                        it.deviceClass == 0x0504 || // Gamepad
+                        it.deviceClass == 0x0508    // Joystick
+                    } ?: false
+
+                    InputDeviceCallbacks.handler.post {
+                        if (isGamepadOrPeripheral || !engine.checkConnectedGamepads()) {
+                            engine.resetAllInputs()
+                            hapticManager.stopAllVibrations()
+                        }
+                    }
+                }
+                android.bluetooth.BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                    val state = intent.getIntExtra(android.bluetooth.BluetoothAdapter.EXTRA_STATE, android.bluetooth.BluetoothAdapter.ERROR)
+                    if (state == android.bluetooth.BluetoothAdapter.STATE_OFF || state == android.bluetooth.BluetoothAdapter.STATE_TURNING_OFF) {
+                        InputDeviceCallbacks.handler.post {
+                            engine.resetAllInputs()
+                            hapticManager.stopAllVibrations()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        super.onStartCommand(intent, flags, startId)
+
+        // Garde critique : ne jamais ajouter de vue overlay sans la permission SYSTEM_ALERT_WINDOW.
+        // En cas de redémarrage START_STICKY après révocation de la permission (MIUI/EMUI),
+        // windowManager.addView() lèverait une BadTokenException et crasherait l'app en pleine partie.
+        if (!Settings.canDrawOverlays(this)) {
+            AppLog.w("Service", "overlay permission missing, service stopped")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val action = intent?.action
+
+        if (action == ACTION_STOP) {
+            AppLog.i("Service", "overlay stop requested")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        val profileId = intent?.getStringExtra(EXTRA_PROFILE_ID) ?: "codm_multiplayer_default"
+        currentProfile = repository.getProfile(profileId) ?: repository.createDefaultCodmProfile()
+
+        startForegroundService()
+        _isServiceRunning.value = true
+
+        currentProfile?.let { prof ->
+            AppLog.i("Service", "engine started with profile '${prof.name}' (${prof.packageName})")
+            engine.setProfile(prof)
+            engine.start()
+        }
+
+        showEdgeHandle()
+
+        return START_STICKY
+    }
+
+    private fun updateScreenMetrics() {
+        val dm = DisplayMetrics()
+        @Suppress("DEPRECATION")
+        windowManager.defaultDisplay.getRealMetrics(dm)
+        injector.setScreenResolution(dm.widthPixels, dm.heightPixels)
+    }
+
+    private fun startForegroundService() {
+        val notificationIntent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, notificationIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(R.string.overlay_notif_title))
+            .setContentText(getString(R.string.overlay_notif_text, currentProfile?.name ?: ""))
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                getString(R.string.notif_channel_name),
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = getString(R.string.notif_channel_desc)
+            }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun showEdgeHandle() {
+        if (edgeHandleView != null) return
+
+        val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+
+        val density = resources.displayMetrics.density
+        val rWidth = (16 * density).toInt()
+        val rHeight = (100 * density).toInt()
+
+        val prefs = getSharedPreferences("overlay_prefs", Context.MODE_PRIVATE)
+        val isRight = prefs.getBoolean("edge_handle_is_right", false)
+        val savedY = prefs.getInt("edge_handle_y", 200)
+
+        edgeHandleParams = WindowManager.LayoutParams(
+            rWidth, rHeight,
+            layoutFlag,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or (if (isRight) Gravity.END else Gravity.START)
+            x = 0
+            y = savedY
+        }
+
+        edgeHandleView = EdgeHandleOverlayView(
+            context = this,
+            windowManager = windowManager,
+            params = edgeHandleParams!!,
+            onOpenHud = {
+                openHudEditor()
+            },
+            onOpenApp = {
+                val appIntent = Intent(this, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                }
+                startActivity(appIntent)
+            },
+            onStopService = {
+                stopSelf()
+            },
+            isStrafeActive = {
+                currentProfile?.joystick?.jiggleStrafe == true
+            },
+            onToggleStrafe = {
+                currentProfile?.let { prof ->
+                    prof.joystick.jiggleStrafe = !prof.joystick.jiggleStrafe
+                    engine.setProfile(prof)
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        repository.saveProfileAsync(prof)
+                    }
+                    val stateMsg = if (prof.joystick.jiggleStrafe) getString(R.string.service_jiggle_on) else getString(R.string.service_jiggle_off)
+                    android.widget.Toast.makeText(this, stateMsg, android.widget.Toast.LENGTH_SHORT).show()
+                }
+            },
+            isAntiRecoilActive = {
+                currentProfile?.camera?.antiRecoilEnabled == true
+            },
+            onToggleAntiRecoil = {
+                currentProfile?.let { prof ->
+                    prof.camera.antiRecoilEnabled = !prof.camera.antiRecoilEnabled
+                    engine.setProfile(prof)
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        repository.saveProfileAsync(prof)
+                    }
+                    val stateMsg = if (prof.camera.antiRecoilEnabled) {
+                        getString(com.kinou.gameassist.R.string.service_antirecoil_on, prof.camera.antiRecoilSpeed)
+                    } else {
+                        getString(R.string.service_antirecoil_off)
+                    }
+                    android.widget.Toast.makeText(this, stateMsg, android.widget.Toast.LENGTH_SHORT).show()
+                }
+            },
+            getAntiRecoilSpeed = {
+                currentProfile?.camera?.antiRecoilSpeed ?: 1.0f
+            },
+            onSetAntiRecoilSpeed = { speed ->
+                currentProfile?.let { prof ->
+                    prof.camera.antiRecoilSpeed = speed
+                    engine.setProfile(prof)
+                }
+            },
+            onPersistAntiRecoilSpeed = { speed ->
+                currentProfile?.let { prof ->
+                    prof.camera.antiRecoilSpeed = speed
+                    engine.setProfile(prof)
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        repository.saveProfileAsync(prof)
+                    }
+                }
+            }
+        )
+
+        windowManager.addView(edgeHandleView, edgeHandleParams)
+    }
+
+    private fun toggleHudEditor() {
+        if (editorView != null) {
+            closeHudEditor()
+        } else {
+            openHudEditor()
+        }
+    }
+
+    private fun openHudEditor() {
+        val prof = currentProfile ?: return
+        if (editorView != null) return
+
+        val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+
+        updateScreenMetrics()
+
+        val baseFlags = WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+            WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS
+
+        val windowFlags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            baseFlags
+        } else {
+            @Suppress("DEPRECATION")
+            baseFlags or WindowManager.LayoutParams.FLAG_FULLSCREEN
+        }
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            layoutFlag,
+            windowFlags,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+        }
+
+        // Copie défensive : l'éditeur mutera sa propre copie. Le profil actif (utilisé en jeu)
+        // ne change qu'au moment de la sauvegarde, rendant l'annulation logique possible.
+        val editorProfile = prof.deepCopy()
+
+        val newEditor = HudEditorOverlayView(
+            this, editorProfile,
+            onSave = { updatedProfile ->
+                currentProfile = updatedProfile
+                engine.setProfile(updatedProfile)
+                closeHudEditor()
+                updateLiveProfile(updatedProfile)
+                lifecycleScope.launch {
+                    repository.saveProfileAsync(updatedProfile)
+                }
+            },
+            onClose = {
+                closeHudEditor()
+            }
+        )
+
+        // Load screenshot asynchronously without blocking main UI thread
+        screenshotLoadJob?.cancel()
+        if (editorProfile.customScreenshotPath != null) {
+            screenshotLoadJob = lifecycleScope.launch(Dispatchers.IO) {
+                val bmp = com.kinou.gameassist.data.repository.ScreenshotManager.loadScreenshotBitmapAsync(this@OverlayService, editorProfile.customScreenshotPath)
+                if (!isActive) {
+                    bmp?.let { if (!it.isRecycled) it.recycle() }
+                    return@launch
+                }
+                withContext(Dispatchers.Main) {
+                    if (editorView == newEditor) {
+                        val old = currentEditorBitmap
+                        currentEditorBitmap = bmp
+                        newEditor.setScreenshot(bmp)
+                        if (old != null && !old.isRecycled && old != bmp) {
+                            old.recycle()
+                        }
+                    } else {
+                        bmp?.let { if (!it.isRecycled) it.recycle() }
+                    }
+                }
+            }
+        }
+
+        edgeHandleView?.visibility = View.GONE
+        try {
+            windowManager.addView(newEditor, params)
+            editorView = newEditor
+            newEditor.requestFocus()
+            engine.setInjectionSuspended(true)
+        } catch (e: Exception) {
+            // En cas d'échec d'ajout de la fenêtre, restaurer la poignée pour ne pas laisser l'UI verrouillée
+            edgeHandleView?.visibility = View.VISIBLE
+        }
+    }
+
+    private fun safeRemoveView(view: View?) {
+        if (view != null) {
+            try {
+                if (view.isAttachedToWindow) {
+                    windowManager.removeViewImmediate(view)
+                }
+            } catch (_: Exception) {
+                // Ignore if view was already removed or detached by system
+            }
+        }
+    }
+
+    private fun formatCursorSpeed(speed: Float) = getString(R.string.cursor_speed, CursorSpeed.format(speed))
+
+    private fun showCursorOverlay() {
+        if (cursorView != null) return
+        val layoutFlag = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            WindowManager.LayoutParams.TYPE_PHONE
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            layoutFlag,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            // Android 12+ bloque les touches qui traversent une surcouche non touchable
+            // d'opacité > 0.8 : à 0.8 les clics injectés atteignent bien le jeu.
+            alpha = 0.8f
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+            gravity = Gravity.TOP or Gravity.START
+        }
+        val view = CursorOverlayView(this)
+        try {
+            windowManager.addView(view, params)
+            cursorView = view
+            view.update(engine.cursorX, engine.cursorY, engine.isCursorTouching)
+            view.showLabel(getString(R.string.cursor_mode_on, CursorSpeed.format(engine.cursorSpeed)), 2500L)
+        } catch (_: Exception) {
+            // Sans curseur visible (permission de surcouche retirée…), ne pas cliquer à l'aveugle
+            engine.exitCursorMode()
+        }
+    }
+
+    private fun hideCursorOverlay() {
+        safeRemoveView(cursorView)
+        cursorView = null
+    }
+
+    private fun closeHudEditor() {
+        engine.setInjectionSuspended(false)
+        screenshotLoadJob?.cancel()
+        screenshotLoadJob = null
+        editorView?.let {
+            it.releaseBitmap()
+            safeRemoveView(it)
+            editorView = null
+        }
+        currentEditorBitmap?.let {
+            if (!it.isRecycled) {
+                it.recycle()
+            }
+        }
+        currentEditorBitmap = null
+        edgeHandleView?.visibility = View.VISIBLE
+    }
+
+    fun cycleProfile(forward: Boolean = true) {
+        lifecycleScope.launch {
+            val allProfiles = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                repository.getAllProfiles()
+            }
+            if (allProfiles.isEmpty()) return@launch
+            val currentIndex = allProfiles.indexOfFirst { it.id == currentProfile?.id }
+            val nextIndex = if (forward) {
+                if (currentIndex < 0) 0 else (currentIndex + 1) % allProfiles.size
+            } else {
+                if (currentIndex <= 0) allProfiles.size - 1 else currentIndex - 1
+            }
+            val nextProfile = allProfiles[nextIndex]
+            currentProfile = nextProfile
+            engine.setProfile(nextProfile)
+            hapticManager.playProfileSwitchHaptic()
+            showHotSwitchToast(nextProfile.name)
+            updateNotification()
+        }
+    }
+
+    private fun showHotSwitchToast(profileName: String) {
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            android.widget.Toast.makeText(applicationContext, getString(R.string.overlay_active_profile_toast, profileName), android.widget.Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun updateNotification() {
+        val notificationIntent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, notificationIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(getString(R.string.overlay_notif_title))
+            .setContentText(getString(R.string.overlay_notif_text, currentProfile?.name ?: ""))
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentIntent(pendingIntent)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(NOTIFICATION_ID, notification)
+    }
+
+    override fun onDestroy() {
+        _isServiceRunning.value = false
+        mainHandler.removeCallbacks(cursorSpeedSave)
+        try {
+            unregisterReceiver(bluetoothDisconnectReceiver)
+        } catch (_: Exception) {}
+        engine.stop()
+        hapticManager.destroy()
+
+        screenshotLoadJob?.cancel()
+        screenshotLoadJob = null
+
+        editorView?.releaseBitmap()
+        currentEditorBitmap?.let {
+            if (!it.isRecycled) {
+                it.recycle()
+            }
+        }
+        currentEditorBitmap = null
+        safeRemoveView(edgeHandleView)
+        edgeHandleView = null
+        safeRemoveView(editorView)
+        editorView = null
+        hideCursorOverlay()
+
+        super.onDestroy()
+    }
+}

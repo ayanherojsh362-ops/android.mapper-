@@ -1,0 +1,1783 @@
+package com.kinou.gameassist.ui.overlay
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.*
+import android.os.Build
+import android.view.HapticFeedbackConstants
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
+import android.view.View
+import android.view.WindowInsets
+import android.view.WindowInsetsController
+import com.kinou.gameassist.R
+import com.kinou.gameassist.data.model.ButtonConfig
+import com.kinou.gameassist.data.model.ButtonMode
+import com.kinou.gameassist.data.model.ButtonRole
+import com.kinou.gameassist.data.model.GameProfile
+import com.kinou.gameassist.data.repository.ScreenshotManager
+import com.kinou.gameassist.engine.ButtonProcessor
+import java.util.UUID
+import kotlin.math.abs
+import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.roundToInt
+import kotlin.math.min
+
+@SuppressLint("ViewConstructor")
+class HudEditorOverlayView(
+    context: Context,
+    private val profile: GameProfile,
+    private val onSave: (GameProfile) -> Unit,
+    private val onClose: () -> Unit,
+    private val onOpenGallery: (() -> Unit)? = null,
+    private val onRemoveScreenshot: (() -> Unit)? = null
+) : View(context) {
+
+    private val density = resources.displayMetrics.density
+
+    // Screenshot Bitmap for In-App & Overlay visual layout
+    @Volatile
+    private var screenshotBitmap: Bitmap? = null
+    private val bitmapSrcRect = Rect()
+    private val bitmapDstRect = RectF()
+    private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+
+    fun setScreenshot(bitmap: Bitmap?) {
+        screenshotBitmap = bitmap
+        postInvalidateOnAnimation()
+    }
+
+    // Selection & Drag State
+    // selectedItem can be ButtonConfig, "JOYSTICK", "CAMERA", or null
+    var selectedItem: Any? = null
+    val selectedButton: ButtonConfig? get() = selectedItem as? ButtonConfig
+    val isJoystickSelected: Boolean get() = selectedItem == "JOYSTICK"
+    val isCameraSelected: Boolean get() = selectedItem == "CAMERA"
+
+    private enum class CamHandle { NONE, BODY, NW, NE, SW, SE }
+    private var activeCamHandle = CamHandle.NONE
+    private var draggedItem: Any? = null
+    private var dragOffsetX = 0f
+    private var dragOffsetY = 0f
+    var isLearning = false
+
+    // HUD editor selection menus (Role / Mode). Popup lists drawn over the canvas, so the user
+    // picks a value instead of tapping through a cycle.
+    private enum class EditorMenu { NONE, ROLE, MODE }
+    private var openMenu = EditorMenu.NONE
+    private val menuPanelRect = RectF()
+    private val menuRowRects = ArrayList<RectF>(8)
+
+    // Opacity & Details Bar
+    private val opacitySteps = floatArrayOf(0.40f, 0.65f, 0.15f, 0.0f)
+    private var opacityIndex = 0
+    var showDetails = true
+    private val currentBgAlpha: Float
+        get() = opacitySteps[opacityIndex]
+
+    // Gamepad Live State
+    private val activeGamepadKeys = mutableSetOf<String>()
+    // Touches appuyées pendant l'apprentissage (combo : "BUTTON_R1+BUTTON_X")
+    private val learnChord = mutableListOf<String>()
+    private var liveLsX = 0f
+    private var liveLsY = 0f
+    private var liveRsX = 0f
+    private var liveRsY = 0f
+
+    // Scale Gesture Detector (Pinch-to-Resize)
+    private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScale(detector: ScaleGestureDetector): Boolean {
+            val factor = detector.scaleFactor
+            when (val item = selectedItem) {
+                is ButtonConfig -> {
+                    item.radius = (item.radius * factor).coerceIn(0.020f, 0.120f)
+                    invalidate()
+                    return true
+                }
+                "JOYSTICK" -> {
+                    profile.joystick.radius = (profile.joystick.radius * factor).coerceIn(0.050f, 0.260f)
+                    invalidate()
+                    return true
+                }
+                "CAMERA" -> {
+                    val cam = profile.camera
+                    val cx = (cam.rectX1 + cam.rectX2) / 2f
+                    val cy = (cam.rectY1 + cam.rectY2) / 2f
+                    val halfW = ((cam.rectX2 - cam.rectX1) / 2f * factor).coerceIn(0.06f, 0.48f)
+                    val halfH = ((cam.rectY2 - cam.rectY1) / 2f * factor).coerceIn(0.06f, 0.48f)
+                    cam.rectX1 = (cx - halfW).coerceIn(0.01f, 0.90f)
+                    cam.rectX2 = (cx + halfW).coerceIn(cam.rectX1 + 0.06f, 0.99f)
+                    cam.rectY1 = (cy - halfH).coerceIn(0.02f, 0.90f)
+                    cam.rectY2 = (cy + halfH).coerceIn(cam.rectY1 + 0.06f, 0.98f)
+                    invalidate()
+                    return true
+                }
+            }
+            return false
+        }
+    })
+
+    // Paints
+    private val bgPaint = Paint().apply {
+        style = Paint.Style.FILL
+    }
+
+    private val btnNormalPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xAA00F0FF.toInt() // Neon Cyan Translucent
+        style = Paint.Style.FILL
+    }
+
+    private val btnSelectedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xDDFF0055.toInt() // Neon Pink Selected
+        style = Paint.Style.FILL
+    }
+
+    private val btnLivePressedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xEE00FF66.toInt() // Neon Green Live Active
+        style = Paint.Style.FILL
+    }
+
+    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFFFFFFFF.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+    }
+
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFFFFFFFF.toInt()
+        textSize = 24f * (resources.displayMetrics.density / 2.75f).coerceIn(0.85f, 1.35f)
+        isFakeBoldText = true
+        textAlign = Paint.Align.CENTER
+    }
+
+    private val joyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0x4400FF66.toInt()
+        style = Paint.Style.FILL
+    }
+
+    private val joyStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF00FF66.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+    }
+
+    private val camPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0x22FFAA00.toInt()
+        style = Paint.Style.FILL
+    }
+
+    private val camStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFFFFAA00.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        pathEffect = DashPathEffect(floatArrayOf(15f, 15f), 0f)
+    }
+
+    private val camSelectedStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF00F0FF.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 4.5f
+    }
+
+    private val handlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF00F0FF.toInt()
+        style = Paint.Style.FILL
+    }
+
+    private val handleStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFFFFFFFF.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 2.5f
+    }
+
+    // Reusable Paints (Zero allocation onDraw)
+    private val crossPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFFFFAA00.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 4f
+    }
+    private val selectRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF00F0FF.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 5f
+    }
+    private val stickLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xAA00FF66.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 6f
+    }
+    private val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF00FF66.toInt()
+        style = Paint.Style.FILL
+    }
+    private val livePulseRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF00FF66.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 8f
+    }
+    private val selectionRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF00FF66.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 5f
+    }
+    private val subTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFFFFFFFF.toInt()
+        textSize = 15f
+        textAlign = Paint.Align.CENTER
+    }
+    private val badgeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val badgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF000000.toInt()
+        textSize = 13f
+        isFakeBoldText = true
+        textAlign = Paint.Align.CENTER
+    }
+    private val roleBadgeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val roleBadgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.BLACK
+        textSize = 11f * density
+        isFakeBoldText = true
+        textAlign = Paint.Align.CENTER
+    }
+    private val showBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xE60D131D.toInt()
+        style = Paint.Style.FILL
+    }
+    private val showStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF00F0FF.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 2f * density
+    }
+    private val showTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF00F0FF.toInt()
+        textSize = 14f * density
+        isFakeBoldText = true
+        textAlign = Paint.Align.CENTER
+    }
+    private val bannerBgPaint = Paint().apply {
+        color = 0xEEFF0055.toInt()
+        style = Paint.Style.FILL
+    }
+    private val bannerTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 14f * density
+        isFakeBoldText = true
+        textAlign = Paint.Align.CENTER
+    }
+    private val barBgPaint = Paint().apply {
+        color = 0xF20A0E14.toInt()
+        style = Paint.Style.FILL
+    }
+    private val uiBtnBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val uiBtnStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 1.2f * density
+    }
+    private val uiBtnTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        isFakeBoldText = true
+        textAlign = Paint.Align.CENTER
+    }
+    private val contextCardBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xF20F151F.toInt()
+        style = Paint.Style.FILL
+    }
+    private val contextCardStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF00F0FF.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 2f * density
+    }
+    private val contextLabelPaint = android.text.TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.LEFT
+        textSize = 14f * density
+        color = 0xFF00F0FF.toInt()
+        isFakeBoldText = true
+    }
+
+    // Selection menu (Role / Mode popup) paints
+    private val menuPanelBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xF21A2330.toInt()
+        style = Paint.Style.FILL
+    }
+    private val menuPanelStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFF00F0FF.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 2f * density
+    }
+    private val menuRowSelectedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0x33FFFFFF
+        style = Paint.Style.FILL
+    }
+    private val menuRowBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val menuTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.LEFT
+        isFakeBoldText = true
+    }
+
+    // Top Bar Visibility & Action Button Bounds
+    var isTopBarHidden = false
+    private val btnCloseRect = RectF()
+    private val btnSaveRect = RectF()
+    private val btnHideRect = RectF()
+    private val btnStrafeRect = RectF()
+    private val btnRecoilRect = RectF()
+    private val btnOpacRect = RectF()
+    private val btnDetailsRect = RectF()
+    private val btnAddRect = RectF()
+    private val btnShotRect = RectF()
+    private val btnRemRect = RectF()
+    private val btnShowRect = RectF()
+
+    /**
+     * Hauteur courante de la barre du haut. Elle n'est plus fixe : en portrait, la barre se replie
+     * sur plusieurs rangées (ToolbarLayout) au lieu de laisser ses derniers boutons hors écran.
+     * Sert au fond, à la bannière d'apprentissage et à la zone tactile réservée.
+     */
+    private var topBarHeight = 0f
+
+    /** Bouton d'une barre d'outils : largeur, styles, et le rect touché/dessiné. */
+    private class BarButton(
+        val label: String,
+        val width: Float,
+        val textSize: Float,
+        val bgColor: Int,
+        val textColor: Int,
+        val strokeColor: Int?,
+        val rect: RectF,
+        /** Indication de placement : ce bouton doit rester sur la même rangée que le suivant. */
+        val keepWithNext: Boolean = false
+    )
+
+    /** Dessine un bouton à l'emplacement calculé par [ToolbarLayout] et met à jour son rect tactile. */
+    private fun drawBarButton(
+        canvas: Canvas,
+        button: BarButton,
+        slot: ToolbarLayout.Slot,
+        rowHeight: Float,
+        radius: Float,
+        topOffset: Float = 0f
+    ) {
+        val top = topOffset + slot.row * rowHeight + 7f * density
+        val bottom = topOffset + slot.row * rowHeight + rowHeight - 7f * density
+        button.rect.set(slot.left, top, slot.right, bottom)
+
+        uiBtnBgPaint.color = button.bgColor
+        canvas.drawRoundRect(button.rect, radius, radius, uiBtnBgPaint)
+        button.strokeColor?.let { stroke ->
+            uiBtnStrokePaint.color = stroke
+            canvas.drawRoundRect(button.rect, radius, radius, uiBtnStrokePaint)
+        }
+        uiBtnTextPaint.color = button.textColor
+        uiBtnTextPaint.textSize = button.textSize
+        canvas.drawText(button.label, button.rect.centerX(), button.rect.centerY() + 5f * density, uiBtnTextPaint)
+    }
+
+    // Draggable Floating "Outils" Button State
+    private var showBtnNormX = -1f
+    private var showBtnNormY = -1f
+    private var isDraggingShowBtn = false
+    private var showBtnDragStartX = 0f
+    private var showBtnDragStartY = 0f
+    private var hasShowBtnMoved = false
+
+    // Bottom Context Bar Action Button Bounds
+    private val btnDelRect = RectF()
+    private val btnNudgeRightRect = RectF()
+    private val btnNudgeDownRect = RectF()
+    private val btnNudgeUpRect = RectF()
+    private val btnNudgeLeftRect = RectF()
+    private val btnSizeIncRect = RectF()
+    private val btnSizeDecRect = RectF()
+    private val btnRoleRect = RectF()
+    private val btnModeRect = RectF()
+    private val btnJitterRect = RectF()
+    private val btnCamRecoilSpdRect = RectF()
+
+    /** Hauteur courante de la barre du bas : elle se replie aussi sur plusieurs rangées. */
+    private var bottomBarHeight = 0f
+    private val btnAssignRect = RectF()
+    private val btnJoyStrafeRect = RectF()
+    private val btnCamRecoilRect = RectF()
+    private val btnCamRecoilIncRect = RectF()
+    private val btnCamRecoilDecRect = RectF()
+
+    init {
+        isFocusable = true
+        isFocusableInTouchMode = true
+        isHapticFeedbackEnabled = true
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            @Suppress("DEPRECATION")
+            systemUiVisibility = (
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            )
+        }
+
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            windowInsetsController?.let { controller ->
+                controller.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+                controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        }
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0f || h <= 0f) return
+
+        // 1. Background Screenshot (if present)
+        val bmp = screenshotBitmap
+        if (bmp != null && !bmp.isRecycled) {
+            try {
+                bitmapSrcRect.set(0, 0, bmp.width, bmp.height)
+                bitmapDstRect.set(0f, 0f, w, h)
+                canvas.drawBitmap(bmp, bitmapSrcRect, bitmapDstRect, bitmapPaint)
+            } catch (e: Exception) {
+                // Ignore safe rendering error if bitmap was recycled concurrently
+            }
+        }
+
+        // 2. Background tint (respects opacity)
+        if (currentBgAlpha > 0.01f) {
+            bgPaint.color = (currentBgAlpha * 255).toInt().shl(24)
+            canvas.drawRect(0f, 0f, w, h, bgPaint)
+        }
+
+        // 3. Camera Zone
+        val cam = profile.camera
+        if (cam.enabled) {
+            val cx1 = cam.rectX1 * w
+            val cy1 = cam.rectY1 * h
+            val cx2 = cam.rectX2 * w
+            val cy2 = cam.rectY2 * h
+
+            canvas.drawRect(cx1, cy1, cx2, cy2, camPaint)
+            if (isCameraSelected) {
+                canvas.drawRect(cx1, cy1, cx2, cy2, camSelectedStroke)
+
+                // Draw 4 corner handles
+                val handleRadius = 14f * density
+                val corners = listOf(
+                    PointF(cx1, cy1),
+                    PointF(cx2, cy1),
+                    PointF(cx1, cy2),
+                    PointF(cx2, cy2)
+                )
+                for (p in corners) {
+                    canvas.drawCircle(p.x, p.y, handleRadius, handlePaint)
+                    canvas.drawCircle(p.x, p.y, handleRadius, handleStroke)
+                }
+            } else {
+                canvas.drawRect(cx1, cy1, cx2, cy2, camStroke)
+            }
+
+            val camTitle = if (isCameraSelected) context.getString(R.string.overlay_camera_selected) else context.getString(R.string.overlay_camera_zone)
+            canvas.drawText(camTitle, (cx1 + cx2) / 2f, cy1 + 35f, textPaint)
+
+            // Live Right Stick Feedback (Aiming reticle inside camera zone)
+            if (hypot(liveRsX, liveRsY) > 0.08f) {
+                val reticleX = (cx1 + cx2) / 2f + liveRsX * ((cx2 - cx1) / 2f) * 0.75f
+                val reticleY = (cy1 + cy2) / 2f + liveRsY * ((cy2 - cy1) / 2f) * 0.75f
+
+                canvas.drawCircle(reticleX, reticleY, 20f * density, crossPaint)
+                canvas.drawLine(reticleX - 30f, reticleY, reticleX + 30f, reticleY, crossPaint)
+                canvas.drawLine(reticleX, reticleY - 30f, reticleX, reticleY + 30f, crossPaint)
+            }
+        }
+
+        // 4. Joystick Zone
+        val joy = profile.joystick
+        if (joy.enabled) {
+            val jx = joy.centerX * w
+            val jy = joy.centerY * h
+            val jr = joy.radius * h
+
+            canvas.drawCircle(jx, jy, jr, joyPaint)
+            canvas.drawCircle(jx, jy, jr, joyStroke)
+            canvas.drawCircle(jx, jy, jr * joy.sprintThreshold, joyStroke)
+
+            if (isJoystickSelected) {
+                canvas.drawCircle(jx, jy, jr + 10f, selectRingPaint)
+            }
+
+            canvas.drawText(context.getString(R.string.overlay_joystick_zone), jx, jy + 10f, textPaint)
+
+            // Live Left Stick Feedback (Thumbstick knob inside joystick)
+            if (hypot(liveLsX, liveLsY) > 0.08f) {
+                val thumbX = jx + liveLsX * jr * 0.75f
+                val thumbY = jy + liveLsY * jr * 0.75f
+
+                canvas.drawLine(jx, jy, thumbX, thumbY, stickLinePaint)
+                canvas.drawCircle(thumbX, thumbY, 18f * density, thumbPaint)
+                canvas.drawCircle(thumbX, thumbY, 18f * density, strokePaint)
+            }
+        }
+
+        // 5. Buttons
+        for (b in profile.buttons) {
+            val bx = b.x * w
+            val by = b.y * h
+            val br = b.radius * h
+
+            val isSelected = b == selectedButton
+            val isLivePressed = if ('+' in b.gamepadButton) b.gamepadButton.split('+').all { it in activeGamepadKeys }
+                                else b.gamepadButton in activeGamepadKeys
+
+            val paint = when {
+                isLivePressed -> btnLivePressedPaint
+                isSelected -> btnSelectedPaint
+                else -> btnNormalPaint
+            }
+
+            canvas.drawCircle(bx, by, br, paint)
+            canvas.drawCircle(bx, by, br, strokePaint)
+
+            if (isLivePressed) {
+                canvas.drawCircle(bx, by, br + 12f, livePulseRingPaint)
+            } else if (isSelected) {
+                canvas.drawCircle(bx, by, br + 8f, selectionRingPaint)
+            }
+
+            val displayKey = b.gamepadButton.replace("BUTTON_", "").replace("TRIGGER_", "")
+            canvas.drawText(displayKey, bx, by - 6f, textPaint)
+            canvas.drawText(b.label, bx, by + 18f, subTextPaint)
+
+            // Mode badge (HOLD, TAP, or RAPID)
+            val modeBadge = when (b.mode) {
+                ButtonMode.HOLD -> context.getString(R.string.overlay_mode_hold_badge)
+                ButtonMode.TAP -> context.getString(R.string.overlay_mode_tap_badge)
+                ButtonMode.RAPID_FIRE -> context.getString(R.string.overlay_mode_rapid_badge)
+            }
+            badgeBgPaint.color = when (b.mode) {
+                ButtonMode.HOLD -> 0xCC00F0FF.toInt()
+                ButtonMode.TAP -> 0xCCFFAA00.toInt()
+                ButtonMode.RAPID_FIRE -> 0xCCFF0055.toInt()
+            }
+            val modeBadgeW = if (b.mode == ButtonMode.RAPID_FIRE) 38f * density else 32f * density
+            canvas.drawRoundRect(bx - modeBadgeW, by + br + 4f, bx + modeBadgeW, by + br + 22f, 6f, 6f, badgeBgPaint)
+            canvas.drawText(modeBadge, bx, by + br + 18f, badgeTextPaint)
+
+            // Role badge (if not normal)
+            if (b.role != ButtonRole.NORMAL) {
+                val (roleTextStr, roleBgColor) = when (b.role) {
+                    ButtonRole.FIRE -> context.getString(R.string.overlay_role_fire_badge) to 0xEEFF0055.toInt()
+                    ButtonRole.RELOAD -> context.getString(R.string.overlay_role_reload_badge) to 0xEEFFAA00.toInt()
+                    ButtonRole.ADS -> context.getString(R.string.overlay_role_ads_badge) to 0xEE00FF66.toInt()
+                    ButtonRole.TOGGLE_RECOIL -> context.getString(R.string.overlay_role_recoil_badge) to 0xEE00F0FF.toInt()
+                    ButtonRole.TOGGLE_STRAFE -> context.getString(R.string.overlay_role_strafe_badge) to 0xEE00FF66.toInt()
+                    ButtonRole.SWITCH_PROFILE -> context.getString(R.string.overlay_role_profile_badge) to 0xEE9C27B0.toInt()
+                    ButtonRole.AIM_JOYSTICK -> context.getString(R.string.overlay_role_aim_badge) to 0xEEFFD600.toInt()
+                    ButtonRole.NORMAL -> "" to 0
+                }
+                roleBadgeBgPaint.color = roleBgColor
+                val badgeW = if (b.role == ButtonRole.SWITCH_PROFILE || b.role == ButtonRole.TOGGLE_RECOIL || b.role == ButtonRole.TOGGLE_STRAFE) 42f * density else 34f * density
+                val badgeH = 16f * density
+                val topY = by - br - badgeH - 2f
+                canvas.drawRoundRect(bx - badgeW, topY, bx + badgeW, topY + badgeH, 6f, 6f, roleBadgeBgPaint)
+                canvas.drawText(roleTextStr, bx, topY + badgeH - 3.5f * density, roleBadgeTextPaint)
+            }
+        }
+
+        // 6. Top Bar UI Controls
+        drawTopBar(canvas, w)
+
+        // 7. Bottom Contextual Bar (when an item is selected and details are enabled)
+        if (selectedItem != null && showDetails) {
+            drawBottomContextBar(canvas, w, h)
+        }
+
+        // 8. Role / Mode selection menu (popup list, drawn on top of everything)
+        if (openMenu != EditorMenu.NONE) {
+            drawSelectionMenu(canvas, w, h)
+        }
+    }
+
+    private fun drawTopBar(canvas: Canvas, w: Float) {
+        val h = height.toFloat()
+        if (isTopBarHidden) {
+            // Clear top bar action button rects so touches don't hit them
+            btnCloseRect.setEmpty()
+            btnSaveRect.setEmpty()
+            btnHideRect.setEmpty()
+            btnStrafeRect.setEmpty()
+            btnRecoilRect.setEmpty()
+            btnOpacRect.setEmpty()
+            btnDetailsRect.setEmpty()
+            btnAddRect.setEmpty()
+            btnShotRect.setEmpty()
+            btnRemRect.setEmpty()
+            topBarHeight = 0f
+
+            // Draw sleek floating pill to reopen the top bar (Draggable anywhere)
+            val showW = 110f * density
+            val showH = 38f * density
+
+            if (showBtnNormX < 0f || showBtnNormY < 0f) {
+                val defaultRight = w - 16f * density
+                val defaultTop = 12f * density
+                showBtnNormX = (defaultRight - showW / 2f) / w
+                showBtnNormY = (defaultTop + showH / 2f) / h
+            }
+
+            val minCenterX = showW / 2f + 4f * density
+            val maxCenterX = w - showW / 2f - 4f * density
+            val minCenterY = showH / 2f + 4f * density
+            val maxCenterY = h - showH / 2f - 4f * density
+
+            val centerX = (showBtnNormX * w).coerceIn(minCenterX, maxCenterX)
+            val centerY = (showBtnNormY * h).coerceIn(minCenterY, maxCenterY)
+
+            btnShowRect.set(centerX - showW / 2f, centerY - showH / 2f, centerX + showW / 2f, centerY + showH / 2f)
+
+            canvas.drawRoundRect(btnShowRect, 12f * density, 12f * density, showBgPaint)
+            canvas.drawRoundRect(btnShowRect, 12f * density, 12f * density, showStrokePaint)
+            canvas.drawText(context.getString(R.string.overlay_btn_show_bar), btnShowRect.centerX(), btnShowRect.centerY() + 5f * density, showTextPaint)
+
+            if (isLearning && selectedButton != null) {
+                val bannerH = 40f * density
+                canvas.drawRect(0f, 0f, w, bannerH, bannerBgPaint)
+                canvas.drawText(
+                    context.getString(R.string.overlay_learning_banner, selectedButton?.label ?: ""),
+                    w / 2f, bannerH / 2f + 5f * density, bannerTextPaint
+                )
+            }
+            return
+        }
+
+        // Expanded Top Bar
+        btnShowRect.setEmpty()
+
+        val rowHeight = 54f * density
+        val btnRadius = 10f * density
+        val btnSpacing = 8f * density
+        val barMargin = 16f * density
+
+        // 1. Bouton « Masquer », ancré à gauche de la première rangée (réservé dans le placement)
+        val hideLabel = context.getString(R.string.overlay_btn_hide_bar)
+        val hideTextSize = 14f * density
+        uiBtnTextPaint.textSize = hideTextSize
+        val hideW = max(88f * density, uiBtnTextPaint.measureText(hideLabel) + 20f * density)
+
+        /**
+         * Décrit un bouton : sa largeur est calculée AVANT le dessin, ce qui permet à la barre de se
+         * replier sur plusieurs rangées au lieu de laisser des boutons hors écran.
+         */
+        fun spec(
+            label: String,
+            minWidthDp: Float,
+            textSizeDp: Float,
+            bgColor: Int,
+            textColor: Int = Color.WHITE,
+            strokeColor: Int? = null,
+            rect: RectF
+        ): BarButton {
+            val textSize = textSizeDp * density
+            uiBtnTextPaint.textSize = textSize
+            return BarButton(
+                label = label,
+                width = max(minWidthDp * density, uiBtnTextPaint.measureText(label) + 20f * density),
+                textSize = textSize,
+                bgColor = bgColor,
+                textColor = textColor,
+                strokeColor = strokeColor,
+                rect = rect
+            )
+        }
+
+        // 2. Boutons alignés à droite, dans l'ordre de dessin (index 0 = le plus à droite)
+        val buttons = ArrayList<BarButton>(9)
+
+        buttons += spec(
+            context.getString(R.string.overlay_btn_close),
+            78f, 14.5f, 0xFF333D4D.toInt(), Color.WHITE, null, btnCloseRect
+        )
+        buttons += spec(
+            context.getString(R.string.overlay_btn_save),
+            84f, 14.5f, 0xFF00FF66.toInt(), Color.BLACK, null, btnSaveRect
+        )
+
+        val strafeActive = profile.joystick.jiggleStrafe
+        buttons += spec(
+            if (strafeActive) context.getString(R.string.overlay_strafe_on) else context.getString(R.string.overlay_strafe_off),
+            94f, 13.5f,
+            if (strafeActive) 0xFF00FF66.toInt() else 0xFF1E2633.toInt(),
+            if (strafeActive) Color.BLACK else Color.WHITE,
+            if (strafeActive) 0xFF00FF66.toInt() else 0xFF445566.toInt(),
+            btnStrafeRect
+        )
+
+        val recoilActive = profile.camera.antiRecoilEnabled
+        buttons += spec(
+            if (recoilActive) context.getString(R.string.overlay_recoil_on) else context.getString(R.string.overlay_recoil_off),
+            94f, 13.5f,
+            if (recoilActive) 0xFFFF9900.toInt() else 0xFF1E2633.toInt(),
+            if (recoilActive) Color.BLACK else Color.WHITE,
+            if (recoilActive) 0xFFFF9900.toInt() else 0xFF445566.toInt(),
+            btnRecoilRect
+        )
+
+        buttons += spec(
+            context.getString(R.string.overlay_btn_opacity, (opacitySteps[opacityIndex] * 100).toInt()),
+            80f, 13.5f, 0xFF1E2633.toInt(), Color.WHITE, null, btnOpacRect
+        )
+        buttons += spec(
+            context.getString(R.string.overlay_btn_details),
+            64f, 14f,
+            if (showDetails) 0xFF243040.toInt() else 0xFF18202A.toInt(),
+            if (showDetails) 0xFF00F0FF.toInt() else 0xFF708090.toInt(),
+            null,
+            btnDetailsRect
+        )
+        buttons += spec(
+            context.getString(R.string.overlay_btn_add),
+            80f, 14.5f, 0xFF00F0FF.toInt(), Color.BLACK, null, btnAddRect
+        )
+
+        if (onOpenGallery != null) {
+            buttons += spec(
+                if (screenshotBitmap != null) context.getString(R.string.btn_change_screenshot) else context.getString(R.string.btn_import_screenshot),
+                95f, 13.5f, 0xFF1E2838.toInt(), 0xFF00F0FF.toInt(), 0xFF00F0FF.toInt(), btnShotRect
+            )
+        } else {
+            btnShotRect.setEmpty()
+        }
+
+        if (screenshotBitmap != null && onRemoveScreenshot != null) {
+            buttons += spec(
+                context.getString(R.string.btn_remove_screenshot),
+                86f, 13.5f, 0x33FF0055.toInt(), 0xFFFF0055.toInt(), 0xFFFF0055.toInt(), btnRemRect
+            )
+        } else {
+            btnRemRect.setEmpty()
+        }
+
+        // 3. Placement : une ou plusieurs rangées, jamais hors de l'écran
+        val layout = ToolbarLayout(
+            availableWidth = w,
+            margin = barMargin,
+            spacing = btnSpacing,
+            rowHeight = rowHeight,
+            firstRowLeftReserve = hideW + btnSpacing
+        )
+        val placement = layout.place(buttons.map { it.width })
+        topBarHeight = placement.height
+
+        canvas.drawRect(0f, 0f, w, topBarHeight, barBgPaint)
+
+        // 4. Bouton « Masquer » : première rangée, à gauche
+        uiBtnTextPaint.color = 0xFF00F0FF.toInt()
+        uiBtnTextPaint.textSize = hideTextSize
+        btnHideRect.set(barMargin, 7f * density, barMargin + hideW, rowHeight - 7f * density)
+        uiBtnBgPaint.color = 0xFF1E2838.toInt()
+        uiBtnStrokePaint.color = 0xFF00F0FF.toInt()
+        canvas.drawRoundRect(btnHideRect, btnRadius, btnRadius, uiBtnBgPaint)
+        canvas.drawRoundRect(btnHideRect, btnRadius, btnRadius, uiBtnStrokePaint)
+        canvas.drawText(hideLabel, btnHideRect.centerX(), btnHideRect.centerY() + 5f * density, uiBtnTextPaint)
+
+        // 5. Boutons de droite à gauche, répartis sur les rangées calculées
+        buttons.forEachIndexed { index, button ->
+            drawBarButton(canvas, button, placement.slots[index], rowHeight, btnRadius)
+        }
+
+        if (isLearning && selectedButton != null) {
+            val bannerH = 40f * density
+            canvas.drawRect(0f, topBarHeight, w, topBarHeight + bannerH, bannerBgPaint)
+            canvas.drawText(
+                context.getString(R.string.overlay_learning_banner, selectedButton?.label ?: ""),
+                w / 2f, topBarHeight + bannerH / 2f + 5f * density, bannerTextPaint
+            )
+        }
+    }
+
+    private fun drawBottomContextBar(canvas: Canvas, w: Float, h: Float) {
+        val rowHeight = 54f * density
+        val btnRadius = 8f * density
+        val btnSpacing = 6f * density
+        val cardMargin = 16f * density   // bords de la carte
+        val btnMargin = 28f * density    // bords de la carte + 12 dp de marge intérieure
+
+        /** Décrit un bouton (largeur calculée avant le dessin, comme la barre du haut). */
+        fun spec(
+            label: String,
+            width: Float,
+            textSize: Float,
+            bgColor: Int,
+            textColor: Int,
+            strokeColor: Int? = null,
+            rect: RectF,
+            keepWithNext: Boolean = false
+        ) = BarButton(label, width, textSize, bgColor, textColor, strokeColor, rect, keepWithNext)
+
+        // 1. Boutons communs, dans l'ordre de dessin (index 0 = le plus à droite)
+        val buttons = ArrayList<BarButton>(12)
+
+        if (selectedButton != null) {
+            buttons += spec(
+                context.getString(R.string.overlay_delete_btn),
+                84f * density, 13.5f * density, 0xFFFF0055.toInt(), Color.WHITE, null, btnDelRect
+            )
+        } else {
+            btnDelRect.setEmpty()
+        }
+
+        val nudgeW = 38f * density
+        buttons += spec("➡️", nudgeW, 14f * density, 0xFF1B2433.toInt(), Color.WHITE, 0xFF00F0FF.toInt(), btnNudgeRightRect)
+        buttons += spec("⬇️", nudgeW, 14f * density, 0xFF1B2433.toInt(), Color.WHITE, 0xFF00F0FF.toInt(), btnNudgeDownRect)
+        buttons += spec("⬆️", nudgeW, 14f * density, 0xFF1B2433.toInt(), Color.WHITE, 0xFF00F0FF.toInt(), btnNudgeUpRect)
+        buttons += spec("⬅️", nudgeW, 14f * density, 0xFF1B2433.toInt(), Color.WHITE, 0xFF00F0FF.toInt(), btnNudgeLeftRect)
+
+        val sizeW = 44f * density
+        // ➕ et ➖ ne doivent jamais être séparés par un repli : ils n'ont de sens que côte à côte.
+        buttons += spec("➕", sizeW, 16f * density, 0xFF243040.toInt(), 0xFF00F0FF.toInt(), null, btnSizeIncRect, keepWithNext = true)
+        buttons += spec("➖", sizeW, 16f * density, 0xFF243040.toInt(), 0xFF00F0FF.toInt(), null, btnSizeDecRect)
+
+        // 2. Actions dépendant de la sélection
+        if (selectedButton != null) {
+            val btn = selectedButton!!
+
+            val roleLabel = roleLabelFor(btn.role)
+            buttons += spec(
+                context.getString(R.string.overlay_role_label, roleLabel),
+                96f * density, 12f * density,
+                roleColorFor(btn.role),
+                roleTextColorFor(btn.role),
+                null,
+                btnRoleRect
+            )
+
+            val modeLabel = modeLabelFor(btn.mode)
+            buttons += spec(
+                context.getString(R.string.overlay_mode_label, modeLabel),
+                92f * density, 12.5f * density,
+                modeColorFor(btn.mode),
+                modeTextColorFor(btn.mode),
+                null,
+                btnModeRect
+            )
+
+            if (btn.mode == ButtonMode.RAPID_FIRE) {
+                val on = btn.rapidFireJitter > 0f
+                val jitterLabel = if (on) "${(btn.rapidFireJitter * 100).roundToInt()}%"
+                else context.getString(R.string.overlay_jitter_off)
+                buttons += spec(
+                    context.getString(R.string.overlay_jitter_label, jitterLabel),
+                    96f * density, 12.5f * density,
+                    if (on) 0xFF00FF66.toInt() else 0xFF243040.toInt(),
+                    if (on) Color.BLACK else Color.WHITE,
+                    if (on) 0xFF00FF66.toInt() else 0xFF00F0FF.toInt(),
+                    btnJitterRect
+                )
+            } else {
+                btnJitterRect.setEmpty()
+            }
+
+            buttons += spec(
+                if (isLearning) context.getString(R.string.overlay_assign_learning) else context.getString(R.string.overlay_assign),
+                96f * density, 13.5f * density,
+                if (isLearning) 0xEEFF0055.toInt() else 0xFF00F0FF.toInt(),
+                if (isLearning) Color.WHITE else Color.BLACK,
+                null,
+                btnAssignRect
+            )
+            btnJoyStrafeRect.setEmpty()
+        } else if (isJoystickSelected) {
+            btnRoleRect.setEmpty()
+            btnModeRect.setEmpty()
+            btnJitterRect.setEmpty()
+            btnAssignRect.setEmpty()
+            btnCamRecoilRect.setEmpty()
+            btnCamRecoilIncRect.setEmpty()
+            btnCamRecoilDecRect.setEmpty()
+
+            val strafeActive = profile.joystick.jiggleStrafe
+            val strafeLabel = if (strafeActive) context.getString(R.string.overlay_strafe_on) else context.getString(R.string.overlay_strafe_off)
+            val strafeTextSize = 13f * density
+            uiBtnTextPaint.textSize = strafeTextSize
+            buttons += spec(
+                strafeLabel,
+                max(100f * density, uiBtnTextPaint.measureText(strafeLabel) + 20f * density),
+                strafeTextSize,
+                if (strafeActive) 0xFF00FF66.toInt() else 0xFF243040.toInt(),
+                if (strafeActive) Color.BLACK else Color.WHITE,
+                if (strafeActive) 0xFF00FF66.toInt() else 0xFF00F0FF.toInt(),
+                btnJoyStrafeRect
+            )
+        } else if (isCameraSelected) {
+            btnRoleRect.setEmpty()
+            btnModeRect.setEmpty()
+            btnJitterRect.setEmpty()
+            btnAssignRect.setEmpty()
+            btnJoyStrafeRect.setEmpty()
+
+            val recoilActive = profile.camera.antiRecoilEnabled
+            val recoilLabel = if (recoilActive) context.getString(R.string.overlay_recoil_on) else context.getString(R.string.overlay_recoil_off)
+            val recoilTextSize = 13f * density
+            uiBtnTextPaint.textSize = recoilTextSize
+            buttons += spec(
+                recoilLabel,
+                max(96f * density, uiBtnTextPaint.measureText(recoilLabel) + 20f * density),
+                recoilTextSize,
+                if (recoilActive) 0xFFFF9900.toInt() else 0xFF243040.toInt(),
+                if (recoilActive) Color.BLACK else Color.WHITE,
+                if (recoilActive) 0xFFFF9900.toInt() else 0xFF00F0FF.toInt(),
+                btnCamRecoilRect
+            )
+
+            if (recoilActive) {
+                val spdText = String.format(java.util.Locale.US, "%.1fx", profile.camera.antiRecoilSpeed)
+                // Le trio ➕ ➖ valeur reste d'un bloc (c'est le réglage de vitesse de recul).
+                buttons += spec("➕", sizeW, 16f * density, 0xFF243040.toInt(), 0xFFFF9900.toInt(), null, btnCamRecoilIncRect, keepWithNext = true)
+                buttons += spec("➖", sizeW, 16f * density, 0xFF243040.toInt(), 0xFFFF9900.toInt(), null, btnCamRecoilDecRect, keepWithNext = true)
+                buttons += spec(
+                    spdText, 42f * density, 12f * density,
+                    0xFF141A22.toInt(), 0xFFFF9900.toInt(), 0xFFFF9900.toInt(), btnCamRecoilSpdRect
+                )
+            } else {
+                btnCamRecoilIncRect.setEmpty()
+                btnCamRecoilDecRect.setEmpty()
+            }
+        } else {
+            btnRoleRect.setEmpty()
+            btnModeRect.setEmpty()
+            btnJitterRect.setEmpty()
+            btnAssignRect.setEmpty()
+            btnJoyStrafeRect.setEmpty()
+            btnCamRecoilRect.setEmpty()
+            btnCamRecoilIncRect.setEmpty()
+            btnCamRecoilDecRect.setEmpty()
+        }
+
+        // 3. Placement : une ou plusieurs rangées, jamais hors de l'écran
+        val layout = ToolbarLayout(
+            availableWidth = w,
+            margin = btnMargin,
+            spacing = btnSpacing,
+            rowHeight = rowHeight
+        )
+        val placement = layout.place(buttons.map { ToolbarLayout.Item(it.width, it.keepWithNext) })
+        bottomBarHeight = placement.height
+
+        val barTop = h - bottomBarHeight - 12f * density
+        val barBottom = h - 12f * density
+        val cardRect = RectF(cardMargin, barTop, w - cardMargin, barBottom)
+        canvas.drawRoundRect(cardRect, 14f * density, 14f * density, contextCardBgPaint)
+        canvas.drawRoundRect(cardRect, 14f * density, 14f * density, contextCardStrokePaint)
+
+        buttons.forEachIndexed { index, button ->
+            drawBarButton(canvas, button, placement.slots[index], rowHeight, btnRadius, barTop)
+        }
+
+        // 4. Titre à gauche, uniquement s'il reste de la place sur la première rangée
+        val titleLeft = cardMargin + 16f * density
+        val firstRowLeft = placement.slots.filter { it.row == 0 }.minOfOrNull { it.left } ?: (w - cardMargin)
+        if (firstRowLeft - titleLeft > 40f * density) {
+            val title = when (val item = selectedItem) {
+                is ButtonConfig -> "🎯 ${item.label} [${item.gamepadButton.replace("BUTTON_", "")}]"
+                "JOYSTICK" -> context.getString(R.string.overlay_joystick_ls)
+                "CAMERA" -> context.getString(R.string.overlay_camera_zone_rs)
+                else -> ""
+            }
+            val ellipTitle = android.text.TextUtils.ellipsize(
+                title,
+                contextLabelPaint,
+                firstRowLeft - titleLeft - 8f * density,
+                android.text.TextUtils.TruncateAt.END
+            ).toString()
+            canvas.drawText(ellipTitle, titleLeft, cardRect.centerY() + 5f * density, contextLabelPaint)
+        }
+    }
+
+    // --- Role / Mode labels & colours, shared by the bottom bar and the selection menus ---
+
+    private fun roleLabelFor(role: ButtonRole): String = when (role) {
+        ButtonRole.FIRE -> context.getString(R.string.overlay_role_fire_label)
+        ButtonRole.RELOAD -> context.getString(R.string.overlay_role_reload_label)
+        ButtonRole.ADS -> context.getString(R.string.overlay_role_ads_badge)
+        ButtonRole.TOGGLE_RECOIL -> context.getString(R.string.overlay_role_recoil_label)
+        ButtonRole.TOGGLE_STRAFE -> context.getString(R.string.overlay_role_strafe_label)
+        ButtonRole.SWITCH_PROFILE -> context.getString(R.string.overlay_role_profile_label)
+        ButtonRole.AIM_JOYSTICK -> context.getString(R.string.overlay_role_aim_label)
+        ButtonRole.NORMAL -> context.getString(R.string.btn_tag_normal)
+    }
+
+    private fun roleColorFor(role: ButtonRole): Int = when (role) {
+        ButtonRole.FIRE -> 0xFFFF0055.toInt()
+        ButtonRole.RELOAD -> 0xFFFFAA00.toInt()
+        ButtonRole.ADS -> 0xFF00FF66.toInt()
+        ButtonRole.TOGGLE_RECOIL -> 0xFF00F0FF.toInt()
+        ButtonRole.TOGGLE_STRAFE -> 0xFF00FF66.toInt()
+        ButtonRole.SWITCH_PROFILE -> 0xFF9C27B0.toInt()
+        ButtonRole.AIM_JOYSTICK -> 0xFFFFD600.toInt()
+        ButtonRole.NORMAL -> 0xFF243040.toInt()
+    }
+
+    private fun roleTextColorFor(role: ButtonRole): Int = when (role) {
+        ButtonRole.NORMAL -> 0xFF00F0FF.toInt()
+        ButtonRole.SWITCH_PROFILE -> Color.WHITE
+        else -> Color.BLACK
+    }
+
+    private fun modeLabelFor(mode: ButtonMode): String = when (mode) {
+        ButtonMode.HOLD -> context.getString(R.string.overlay_mode_hold_badge)
+        ButtonMode.TAP -> context.getString(R.string.overlay_mode_tap_badge)
+        ButtonMode.RAPID_FIRE -> context.getString(R.string.overlay_mode_rapid_badge)
+    }
+
+    private fun modeColorFor(mode: ButtonMode): Int = when (mode) {
+        ButtonMode.HOLD -> 0xFF00F0FF.toInt()
+        ButtonMode.TAP -> 0xFFFFAA00.toInt()
+        ButtonMode.RAPID_FIRE -> 0xFFFF0055.toInt()
+    }
+
+    private fun modeTextColorFor(mode: ButtonMode): Int =
+        if (mode == ButtonMode.RAPID_FIRE) Color.WHITE else Color.BLACK
+
+    /**
+     * Handles a tap while a Role/Mode menu is open. Returns true when the tap was consumed by the
+     * menu (a row was picked, or the menu was dismissed), so the tap never reaches the HUD below.
+     */
+    private fun handleMenuTouch(tx: Float, ty: Float): Boolean {
+        if (openMenu == EditorMenu.NONE) return false
+        val btn = selectedButton
+        if (btn == null) {
+            openMenu = EditorMenu.NONE
+            invalidate()
+            return true
+        }
+        if (menuPanelRect.contains(tx, ty)) {
+            val index = menuRowRects.indexOfFirst { it.contains(tx, ty) }
+            if (index >= 0) {
+                when (openMenu) {
+                    EditorMenu.ROLE -> {
+                        val role = ButtonRole.entries[index]
+                        btn.role = role
+                        // Aim is hold-only: a role that no longer allows the current mode falls
+                        // back to a valid one instead of keeping a lying badge.
+                        btn.mode = ButtonConfig.coerceModeForRole(role, btn.mode)
+                    }
+                    EditorMenu.MODE -> {
+                        val modes = ButtonConfig.modesForRole(btn.role)
+                        if (index < modes.size) btn.mode = modes[index]
+                    }
+                    EditorMenu.NONE -> {}
+                }
+                performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+            }
+            openMenu = EditorMenu.NONE
+            invalidate()
+            return true
+        }
+        // Tap outside the panel: dismiss without acting on whatever sits underneath.
+        openMenu = EditorMenu.NONE
+        invalidate()
+        return true
+    }
+
+    /** Draws the Role/Mode popup list above the bottom bar, and records the row hit boxes. */
+    private fun drawSelectionMenu(canvas: Canvas, w: Float, h: Float) {
+        val btn = selectedButton
+        if (btn == null) {
+            openMenu = EditorMenu.NONE
+            return
+        }
+        val entries: List<Triple<String, Int, Int>> = when (openMenu) {
+            EditorMenu.ROLE -> ButtonRole.entries.map {
+                Triple(roleLabelFor(it), roleColorFor(it), roleTextColorFor(it))
+            }
+            EditorMenu.MODE -> ButtonConfig.modesForRole(btn.role).map {
+                Triple(modeLabelFor(it), modeColorFor(it), modeTextColorFor(it))
+            }
+            EditorMenu.NONE -> return
+        }
+        if (entries.isEmpty()) {
+            openMenu = EditorMenu.NONE
+            return
+        }
+
+        val sideMargin = 16f * density
+        val panelWidth = (300f * density).coerceAtMost(w - 2f * sideMargin)
+        val gap = 4f * density
+        val padding = 10f * density
+        val barTop = h - bottomBarHeight - 12f * density
+        val minTop = topBarHeight + 8f * density
+        val available = (barTop - 10f * density - minTop).coerceAtLeast(120f * density)
+
+        var rowHeight = 46f * density
+        var total = entries.size * rowHeight + (entries.size - 1) * gap + 2f * padding
+        if (total > available) {
+            val needed = (available - 2f * padding - (entries.size - 1) * gap) / entries.size
+            rowHeight = needed.coerceIn(30f * density, rowHeight)
+            total = entries.size * rowHeight + (entries.size - 1) * gap + 2f * padding
+        }
+
+        val anchorRect = if (openMenu == EditorMenu.ROLE) btnRoleRect else btnModeRect
+        val panelLeft = (anchorRect.centerX() - panelWidth / 2f)
+            .coerceIn(sideMargin, (w - panelWidth - sideMargin).coerceAtLeast(sideMargin))
+        val panelTop = (barTop - 10f * density - total).coerceAtLeast(minTop)
+        menuPanelRect.set(panelLeft, panelTop, panelLeft + panelWidth, panelTop + total)
+
+        canvas.drawRoundRect(menuPanelRect, 12f * density, 12f * density, menuPanelBgPaint)
+        canvas.drawRoundRect(menuPanelRect, 12f * density, 12f * density, menuPanelStrokePaint)
+
+        menuRowRects.clear()
+        val currentRole = btn.role
+        val currentModes = ButtonConfig.modesForRole(btn.role)
+        menuTextPaint.textSize = (rowHeight * 0.42f).coerceIn(12f * density, 17f * density)
+        var rowTop = panelTop + padding
+        entries.forEachIndexed { index, entry ->
+            val row = RectF(panelLeft + padding, rowTop, panelLeft + panelWidth - padding, rowTop + rowHeight)
+            menuRowRects.add(row)
+
+            val isCurrent = if (openMenu == EditorMenu.ROLE) {
+                ButtonRole.entries[index] == currentRole
+            } else {
+                currentModes.getOrNull(index) == btn.mode
+            }
+
+            menuRowBgPaint.color = entry.second
+            menuRowBgPaint.alpha = if (isCurrent) 255 else 190
+            canvas.drawRoundRect(row, 8f * density, 8f * density, menuRowBgPaint)
+            if (isCurrent) {
+                canvas.drawRoundRect(row, 8f * density, 8f * density, menuPanelStrokePaint)
+            }
+
+            menuTextPaint.color = entry.third
+            canvas.drawText(
+                entry.first,
+                row.left + 12f * density,
+                row.centerY() + menuTextPaint.textSize * 0.35f,
+                menuTextPaint
+            )
+            rowTop += rowHeight + gap
+        }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        scaleDetector.onTouchEvent(event)
+        if (scaleDetector.isInProgress) {
+            draggedItem = null
+            invalidate()
+            return true
+        }
+
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val tx = event.x
+        val ty = event.y
+
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                // 0. An open Role/Mode menu takes the tap first (select a row, or dismiss).
+                if (handleMenuTouch(tx, ty)) {
+                    return true
+                }
+
+                // 1. Check Top Bar clicks
+                if (isTopBarHidden) {
+                    if (btnShowRect.contains(tx, ty)) {
+                        isDraggingShowBtn = true
+                        showBtnDragStartX = tx
+                        showBtnDragStartY = ty
+                        hasShowBtnMoved = false
+                        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                        return true
+                    }
+                } else {
+                    // Hide Top Bar
+                    if (btnHideRect.contains(tx, ty)) {
+                        isTopBarHidden = true
+                        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                        invalidate()
+                        return true
+                    }
+
+                    // ✖ Fermer
+                    if (btnCloseRect.contains(tx, ty)) {
+                        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                        onClose()
+                        return true
+                    }
+
+                    // 💾 Sauvegarder
+                    if (btnSaveRect.contains(tx, ty)) {
+                        performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                        onSave(profile)
+                        return true
+                    }
+
+                    // ⚡ Strafe Quick Toggle
+                    if (btnStrafeRect.contains(tx, ty)) {
+                        profile.joystick.jiggleStrafe = !profile.joystick.jiggleStrafe
+                        performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                        invalidate()
+                        return true
+                    }
+
+                    // 🎯 Recul Quick Toggle
+                    if (btnRecoilRect.contains(tx, ty)) {
+                        profile.camera.antiRecoilEnabled = !profile.camera.antiRecoilEnabled
+                        performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                        invalidate()
+                        return true
+                    }
+
+                    // 🎨 Opacité Toggle
+                    if (btnOpacRect.contains(tx, ty)) {
+                        opacityIndex = (opacityIndex + 1) % opacitySteps.size
+                        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                        invalidate()
+                        return true
+                    }
+
+                    // 📋 Details Mode
+                    if (btnDetailsRect.contains(tx, ty)) {
+                        showDetails = !showDetails
+                        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                        invalidate()
+                        return true
+                    }
+
+                    // ➕ Ajouter Bouton
+                    if (btnAddRect.contains(tx, ty)) {
+                        val newBtn = ButtonConfig(
+                            id = "btn_${UUID.randomUUID().toString().take(6)}",
+                            label = context.getString(com.kinou.gameassist.R.string.overlay_new_action_label, profile.buttons.size + 1),
+                            gamepadButton = "BUTTON_A",
+                            x = 0.5f,
+                            y = 0.5f,
+                            radius = 0.045f,
+                            mode = ButtonMode.TAP
+                        )
+                        profile.buttons.add(newBtn)
+                        selectedItem = newBtn
+                        isLearning = true
+                        performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                        invalidate()
+                        return true
+                    }
+
+                    // 📸 Capture Screenshot
+                    if (onOpenGallery != null && btnShotRect.contains(tx, ty)) {
+                        performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                        onOpenGallery.invoke()
+                        return true
+                    }
+
+                    // 🗑️ Retirer Fond Screenshot
+                    if (screenshotBitmap != null && onRemoveScreenshot != null && btnRemRect.contains(tx, ty)) {
+                        performHapticFeedback(HapticFeedbackConstants.REJECT)
+                        onRemoveScreenshot.invoke()
+                        return true
+                    }
+
+                    // If tap is inside the top bar background area (not on a button), consume it
+                    if (ty <= topBarHeight) {
+                        return true
+                    }
+                }
+
+                // 2. Check Bottom Context Bar clicks (if active and details enabled)
+                if (selectedItem != null && showDetails) {
+                    // Delete
+                    if (selectedButton != null && btnDelRect.contains(tx, ty)) {
+                        profile.buttons.remove(selectedButton)
+                        selectedItem = null
+                        isLearning = false
+                        performHapticFeedback(HapticFeedbackConstants.REJECT)
+                        invalidate()
+                        return true
+                    }
+
+                    // Nudge Right (➡️)
+                    if (btnNudgeRightRect.contains(tx, ty)) {
+                        nudgeSelectedItem(0.003f, 0f)
+                        return true
+                    }
+
+                    // Nudge Down (⬇️)
+                    if (btnNudgeDownRect.contains(tx, ty)) {
+                        nudgeSelectedItem(0f, 0.003f)
+                        return true
+                    }
+
+                    // Nudge Up (⬆️)
+                    if (btnNudgeUpRect.contains(tx, ty)) {
+                        nudgeSelectedItem(0f, -0.003f)
+                        return true
+                    }
+
+                    // Nudge Left (⬅️)
+                    if (btnNudgeLeftRect.contains(tx, ty)) {
+                        nudgeSelectedItem(-0.003f, 0f)
+                        return true
+                    }
+
+                    // Size Increment (➕)
+                    if (btnSizeIncRect.contains(tx, ty)) {
+                        adjustSelectedItemSize(1.08f)
+                        return true
+                    }
+
+                    // Size Decrement (➖)
+                    if (btnSizeDecRect.contains(tx, ty)) {
+                        adjustSelectedItemSize(0.92f)
+                        return true
+                    }
+
+                    // Button-specific actions: Role, Mode & Assign
+                    if (selectedButton != null) {
+                        val btn = selectedButton!!
+
+                        // Role menu: pick a role from the popup list instead of cycling.
+                        if (btnRoleRect.contains(tx, ty)) {
+                            openMenu = if (openMenu == EditorMenu.ROLE) EditorMenu.NONE else EditorMenu.ROLE
+                            performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                            invalidate()
+                            return true
+                        }
+
+                        // Mode menu: pick a mode (aim is hold-only, so its list has a single entry).
+                        if (btnModeRect.contains(tx, ty)) {
+                            openMenu = if (openMenu == EditorMenu.MODE) EditorMenu.NONE else EditorMenu.MODE
+                            performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                            invalidate()
+                            return true
+                        }
+
+                        // Rapid-fire tap jitter
+                        if (btn.mode == ButtonMode.RAPID_FIRE && btnJitterRect.contains(tx, ty)) {
+                            btn.rapidFireJitter = ButtonConfig.nextJitter(btn.rapidFireJitter)
+                            performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                            invalidate()
+                            return true
+                        }
+
+                        // Assign Button
+                        if (btnAssignRect.contains(tx, ty)) {
+                            isLearning = !isLearning
+                            performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                            invalidate()
+                            return true
+                        }
+                    }
+
+                    // ⚡ Joystick Strafe Toggle
+                    if (isJoystickSelected && btnJoyStrafeRect.contains(tx, ty)) {
+                        profile.joystick.jiggleStrafe = !profile.joystick.jiggleStrafe
+                        performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                        invalidate()
+                        return true
+                    }
+
+                    // 🎯 Camera Recoil Toggle & Speed
+                    if (isCameraSelected) {
+                        if (btnCamRecoilRect.contains(tx, ty)) {
+                            profile.camera.antiRecoilEnabled = !profile.camera.antiRecoilEnabled
+                            performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                            invalidate()
+                            return true
+                        }
+                        if (btnCamRecoilDecRect.contains(tx, ty)) {
+                            profile.camera.antiRecoilSpeed = Math.round((profile.camera.antiRecoilSpeed - 0.2f).coerceIn(0.1f, 10.0f) * 10f) / 10f
+                            performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                            invalidate()
+                            return true
+                        }
+                        if (btnCamRecoilIncRect.contains(tx, ty)) {
+                            profile.camera.antiRecoilSpeed = Math.round((profile.camera.antiRecoilSpeed + 0.2f).coerceIn(0.1f, 10.0f) * 10f) / 10f
+                            performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                            invalidate()
+                            return true
+                        }
+                    }
+
+                    // If tap inside the bottom bar card, consume it
+                    val barTop = h - bottomBarHeight - 12f * density
+                    val barBottom = h - 12f * density
+                    if (ty in barTop..barBottom && tx in (16f * density)..(w - 16f * density)) {
+                        return true
+                    }
+                }
+
+                // 3. Check Camera Corner Handles (if camera selected)
+                if (isCameraSelected) {
+                    val cam = profile.camera
+                    val cx1 = cam.rectX1 * w
+                    val cy1 = cam.rectY1 * h
+                    val cx2 = cam.rectX2 * w
+                    val cy2 = cam.rectY2 * h
+                    val hitRadius = 26f * density
+
+                    val handle = when {
+                        hypot(tx - cx1, ty - cy1) <= hitRadius -> CamHandle.NW
+                        hypot(tx - cx2, ty - cy1) <= hitRadius -> CamHandle.NE
+                        hypot(tx - cx1, ty - cy2) <= hitRadius -> CamHandle.SW
+                        hypot(tx - cx2, ty - cy2) <= hitRadius -> CamHandle.SE
+                        else -> CamHandle.NONE
+                    }
+
+                    if (handle != CamHandle.NONE) {
+                        draggedItem = "CAMERA"
+                        activeCamHandle = handle
+                        dragOffsetX = tx
+                        dragOffsetY = ty
+                        invalidate()
+                        return true
+                    }
+                }
+
+                // 4. Check Buttons
+                for (b in profile.buttons.reversed()) {
+                    val bx = b.x * w
+                    val by = b.y * h
+                    val br = b.radius * h
+                    if (hypot(tx - bx, ty - by) <= br * 1.25) {
+                        selectedItem = b
+                        draggedItem = b
+                        dragOffsetX = tx - bx
+                        dragOffsetY = ty - by
+                        isLearning = false
+                        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                        invalidate()
+                        return true
+                    }
+                }
+
+                // 5. Check Joystick
+                val joy = profile.joystick
+                val jx = joy.centerX * w
+                val jy = joy.centerY * h
+                val jr = joy.radius * h
+                if (hypot(tx - jx, ty - jy) <= jr) {
+                    selectedItem = "JOYSTICK"
+                    draggedItem = "JOYSTICK"
+                    dragOffsetX = tx - jx
+                    dragOffsetY = ty - jy
+                    isLearning = false
+                    performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    invalidate()
+                    return true
+                }
+
+                // 6. Check Camera Zone Body
+                val cam = profile.camera
+                if (cam.enabled) {
+                    val cx1 = cam.rectX1 * w
+                    val cy1 = cam.rectY1 * h
+                    val cx2 = cam.rectX2 * w
+                    val cy2 = cam.rectY2 * h
+                    if (tx in cx1..cx2 && ty in cy1..cy2) {
+                        selectedItem = "CAMERA"
+                        draggedItem = "CAMERA"
+                        activeCamHandle = CamHandle.BODY
+                        dragOffsetX = tx - cx1
+                        dragOffsetY = ty - cy1
+                        isLearning = false
+                        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                        invalidate()
+                        return true
+                    }
+                }
+
+                // Click outside
+                selectedItem = null
+                draggedItem = null
+                activeCamHandle = CamHandle.NONE
+                isLearning = false
+                invalidate()
+                return true
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                if (isTopBarHidden && isDraggingShowBtn) {
+                    val dx = tx - showBtnDragStartX
+                    val dy = ty - showBtnDragStartY
+                    if (hypot(dx.toDouble(), dy.toDouble()) > 6.0 * density) {
+                        hasShowBtnMoved = true
+                    }
+                    showBtnNormX = tx / w
+                    showBtnNormY = ty / h
+                    invalidate()
+                    return true
+                }
+
+                when (val item = draggedItem) {
+                    is ButtonConfig -> {
+                        item.x = ((tx - dragOffsetX) / w).coerceIn(0.02f, 0.98f)
+                        item.y = ((ty - dragOffsetY) / h).coerceIn(0.02f, 0.98f)
+                        invalidate()
+                    }
+                    "JOYSTICK" -> {
+                        profile.joystick.centerX = ((tx - dragOffsetX) / w).coerceIn(0.05f, 0.50f)
+                        profile.joystick.centerY = ((ty - dragOffsetY) / h).coerceIn(0.05f, 0.95f)
+                        invalidate()
+                    }
+                    "CAMERA" -> {
+                        val c = profile.camera
+                        val curW = c.rectX2 - c.rectX1
+                        val curH = c.rectY2 - c.rectY1
+
+                        when (activeCamHandle) {
+                            CamHandle.BODY -> {
+                                val newX1 = ((tx - dragOffsetX) / w).coerceIn(0.01f, 0.99f - curW)
+                                val newY1 = ((ty - dragOffsetY) / h).coerceIn(0.01f, 0.99f - curH)
+                                c.rectX1 = newX1
+                                c.rectY1 = newY1
+                                c.rectX2 = newX1 + curW
+                                c.rectY2 = newY1 + curH
+                            }
+                            CamHandle.NW -> {
+                                c.rectX1 = (tx / w).coerceIn(0.01f, c.rectX2 - 0.06f)
+                                c.rectY1 = (ty / h).coerceIn(0.01f, c.rectY2 - 0.06f)
+                            }
+                            CamHandle.NE -> {
+                                c.rectX2 = (tx / w).coerceIn(c.rectX1 + 0.06f, 0.99f)
+                                c.rectY1 = (ty / h).coerceIn(0.01f, c.rectY2 - 0.06f)
+                            }
+                            CamHandle.SW -> {
+                                c.rectX1 = (tx / w).coerceIn(0.01f, c.rectX2 - 0.06f)
+                                c.rectY2 = (ty / h).coerceIn(c.rectY1 + 0.06f, 0.99f)
+                            }
+                            CamHandle.SE -> {
+                                c.rectX2 = (tx / w).coerceIn(c.rectX1 + 0.06f, 0.99f)
+                                c.rectY2 = (ty / h).coerceIn(c.rectY1 + 0.06f, 0.99f)
+                            }
+                            CamHandle.NONE -> {}
+                        }
+                        invalidate()
+                    }
+                }
+                return true
+            }
+
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (isTopBarHidden && isDraggingShowBtn) {
+                    isDraggingShowBtn = false
+                    if (!hasShowBtnMoved) {
+                        isTopBarHidden = false
+                        performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+                        invalidate()
+                    }
+                    return true
+                }
+                draggedItem = null
+                activeCamHandle = CamHandle.NONE
+                return true
+            }
+        }
+        return super.onTouchEvent(event)
+    }
+
+    private fun nudgeSelectedItem(dx: Float, dy: Float) {
+        when (val item = selectedItem) {
+            is ButtonConfig -> {
+                item.x = (item.x + dx).coerceIn(0.02f, 0.98f)
+                item.y = (item.y + dy).coerceIn(0.02f, 0.98f)
+            }
+            "JOYSTICK" -> {
+                profile.joystick.centerX = (profile.joystick.centerX + dx).coerceIn(0.05f, 0.50f)
+                profile.joystick.centerY = (profile.joystick.centerY + dy).coerceIn(0.05f, 0.95f)
+            }
+            "CAMERA" -> {
+                val c = profile.camera
+                val w = c.rectX2 - c.rectX1
+                val h = c.rectY2 - c.rectY1
+                c.rectX1 = (c.rectX1 + dx).coerceIn(0.01f, 0.99f - w)
+                c.rectY1 = (c.rectY1 + dy).coerceIn(0.01f, 0.99f - h)
+                c.rectX2 = c.rectX1 + w
+                c.rectY2 = c.rectY1 + h
+            }
+        }
+        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        invalidate()
+    }
+
+    private fun adjustSelectedItemSize(factor: Float) {
+        when (val item = selectedItem) {
+            is ButtonConfig -> {
+                item.radius = (item.radius * factor).coerceIn(0.020f, 0.120f)
+            }
+            "JOYSTICK" -> {
+                profile.joystick.radius = (profile.joystick.radius * factor).coerceIn(0.050f, 0.260f)
+            }
+            "CAMERA" -> {
+                val c = profile.camera
+                val cx = (c.rectX1 + c.rectX2) / 2f
+                val cy = (c.rectY1 + c.rectY2) / 2f
+                val halfW = ((c.rectX2 - c.rectX1) / 2f * factor).coerceIn(0.06f, 0.48f)
+                val halfH = ((c.rectY2 - c.rectY1) / 2f * factor).coerceIn(0.06f, 0.48f)
+                c.rectX1 = (cx - halfW).coerceIn(0.01f, 0.90f)
+                c.rectX2 = (cx + halfW).coerceIn(c.rectX1 + 0.06f, 0.99f)
+                c.rectY1 = (cy - halfH).coerceIn(0.02f, 0.90f)
+                c.rectY2 = (cy + halfH).coerceIn(c.rectY1 + 0.06f, 0.98f)
+            }
+        }
+        performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+        invalidate()
+    }
+
+    private fun keyCodeToGamepadKey(keyCode: Int): String? = when (keyCode) {
+        KeyEvent.KEYCODE_BUTTON_A -> "BUTTON_A"
+        KeyEvent.KEYCODE_BUTTON_B -> "BUTTON_B"
+        KeyEvent.KEYCODE_BUTTON_X -> "BUTTON_X"
+        KeyEvent.KEYCODE_BUTTON_Y -> "BUTTON_Y"
+        KeyEvent.KEYCODE_BUTTON_L1 -> "BUTTON_L1"
+        KeyEvent.KEYCODE_BUTTON_R1 -> "BUTTON_R1"
+        KeyEvent.KEYCODE_BUTTON_L2 -> "BUTTON_L2"
+        KeyEvent.KEYCODE_BUTTON_R2 -> "BUTTON_R2"
+        KeyEvent.KEYCODE_BUTTON_THUMBL -> "BUTTON_THUMBL"
+        KeyEvent.KEYCODE_BUTTON_THUMBR -> "BUTTON_THUMBR"
+        KeyEvent.KEYCODE_BUTTON_START -> "BUTTON_START"
+        KeyEvent.KEYCODE_BUTTON_SELECT -> "BUTTON_SELECT"
+        KeyEvent.KEYCODE_DPAD_UP -> "DPAD_UP"
+        KeyEvent.KEYCODE_DPAD_DOWN -> "DPAD_DOWN"
+        KeyEvent.KEYCODE_DPAD_LEFT -> "DPAD_LEFT"
+        KeyEvent.KEYCODE_DPAD_RIGHT -> "DPAD_RIGHT"
+        KeyEvent.KEYCODE_BUTTON_1, KeyEvent.KEYCODE_BUTTON_5, KeyEvent.KEYCODE_BUTTON_C -> "BUTTON_PADDLE1"
+        KeyEvent.KEYCODE_BUTTON_2, KeyEvent.KEYCODE_BUTTON_6, KeyEvent.KEYCODE_BUTTON_Z -> "BUTTON_PADDLE2"
+        KeyEvent.KEYCODE_BUTTON_3, KeyEvent.KEYCODE_BUTTON_7 -> "BUTTON_PADDLE3"
+        KeyEvent.KEYCODE_BUTTON_4, KeyEvent.KEYCODE_BUTTON_8 -> "BUTTON_PADDLE4"
+        else -> null
+    }
+
+    private fun finishLearning() {
+        val keys = learnChord.toList()
+        learnChord.clear()
+        if (keys.isEmpty()) return
+        // Avec trois touches maintenues, on retient les deux plus récentes : c'est l'appui qui vient
+        // d'être relâché qui définit le combo.
+        val chord = if (keys.size > 2) keys.takeLast(2) else keys
+        val candidate = chord.joinToString("+")
+        val target = selectedButton
+
+        // Ambiguïté refusée : deux combos visant le même déclencheur. findCombo() trancherait par
+        // l'ordre des boutons du profil, ce qui n'est pas compréhensible pour l'utilisateur.
+        val trigger = ButtonProcessor.parseCombo(candidate)?.second
+        val clashes = trigger != null && target != null && profile.buttons.any { other ->
+            other !== target &&
+                ButtonProcessor.parseCombo(ButtonProcessor.canonicalGamepadKey(other.gamepadButton))?.second == trigger
+        }
+
+        isLearning = false
+        if (target == null || clashes) {
+            if (clashes) performHapticFeedback(HapticFeedbackConstants.REJECT)
+            invalidate()
+            return
+        }
+
+        target.gamepadButton = candidate
+        performHapticFeedback(HapticFeedbackConstants.CONFIRM)
+        invalidate()
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        val keyName = keyCodeToGamepadKey(keyCode)
+        if (keyName != null) {
+            if (isLearning && selectedButton != null) {
+                // Assigné au relâchement : maintenir R1 puis appuyer X donne "BUTTON_R1+BUTTON_X"
+                learnChord.retainAll(activeGamepadKeys)
+                if (keyName !in learnChord) learnChord.add(keyName)
+            }
+            activeGamepadKeys.add(keyName)
+            invalidate()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        val keyName = keyCodeToGamepadKey(keyCode)
+        if (keyName != null) {
+            activeGamepadKeys.remove(keyName)
+            if (isLearning && selectedButton != null && learnChord.isNotEmpty()) {
+                finishLearning()
+            } else if (!isLearning) {
+                learnChord.clear()
+            }
+            invalidate()
+            return true
+        }
+        return super.onKeyUp(keyCode, event)
+    }
+
+    override fun onGenericMotionEvent(event: MotionEvent): Boolean {
+        val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
+        val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
+        val ltVal = maxOf(event.getAxisValue(MotionEvent.AXIS_LTRIGGER), event.getAxisValue(MotionEvent.AXIS_BRAKE))
+        val rtVal = maxOf(event.getAxisValue(MotionEvent.AXIS_RTRIGGER), event.getAxisValue(MotionEvent.AXIS_GAS))
+
+        val boundKey = when {
+            hatY <= -0.4f -> "DPAD_UP"
+            hatY >= 0.4f -> "DPAD_DOWN"
+            hatX <= -0.4f -> "DPAD_LEFT"
+            hatX >= 0.4f -> "DPAD_RIGHT"
+            ltVal > 0.50f -> "BUTTON_L2"
+            rtVal > 0.50f -> "BUTTON_R2"
+            else -> null
+        }
+
+        if (isLearning && selectedButton != null && boundKey != null) {
+            // D-pad / gâchettes : assignés à l'appui, combinés avec un bouton déjà maintenu
+            learnChord.retainAll(activeGamepadKeys)
+            if (boundKey !in learnChord) learnChord.add(boundKey)
+            finishLearning()
+            return true
+        }
+
+        // Live D-pad tracking
+        if (hatY <= -0.4f) activeGamepadKeys.add("DPAD_UP") else activeGamepadKeys.remove("DPAD_UP")
+        if (hatY >= 0.4f) activeGamepadKeys.add("DPAD_DOWN") else activeGamepadKeys.remove("DPAD_DOWN")
+        if (hatX <= -0.4f) activeGamepadKeys.add("DPAD_LEFT") else activeGamepadKeys.remove("DPAD_LEFT")
+        if (hatX >= 0.4f) activeGamepadKeys.add("DPAD_RIGHT") else activeGamepadKeys.remove("DPAD_RIGHT")
+
+        // Live Triggers tracking
+        if (ltVal > 0.40f) activeGamepadKeys.add("BUTTON_L2") else activeGamepadKeys.remove("BUTTON_L2")
+        if (rtVal > 0.40f) activeGamepadKeys.add("BUTTON_R2") else activeGamepadKeys.remove("BUTTON_R2")
+
+        // Live Sticks tracking
+        val rawLsX = event.getAxisValue(MotionEvent.AXIS_X)
+        val rawLsY = event.getAxisValue(MotionEvent.AXIS_Y)
+        liveLsX = if (abs(rawLsX) > 0.08f) rawLsX else 0f
+        liveLsY = if (abs(rawLsY) > 0.08f) rawLsY else 0f
+
+        val rawRsX = if (event.getAxisValue(MotionEvent.AXIS_Z) != 0f) event.getAxisValue(MotionEvent.AXIS_Z) else event.getAxisValue(MotionEvent.AXIS_RX)
+        val rawRsY = if (event.getAxisValue(MotionEvent.AXIS_RZ) != 0f) event.getAxisValue(MotionEvent.AXIS_RZ) else event.getAxisValue(MotionEvent.AXIS_RY)
+        liveRsX = if (abs(rawRsX) > 0.08f) rawRsX else 0f
+        liveRsY = if (abs(rawRsY) > 0.08f) rawRsY else 0f
+
+        invalidate()
+        return super.onGenericMotionEvent(event)
+    }
+
+    fun releaseBitmap() {
+        screenshotBitmap = null
+        invalidate()
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        // Do not recycle bitmap on detach; ownership is managed by parent container
+        screenshotBitmap = null
+    }
+}
